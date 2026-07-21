@@ -1,0 +1,23 @@
+# Grammar forks carried by rinch-ce. Source of truth for scripts/grammar-forks.sh.
+#
+# We maintain these branches ourselves rather than upstreaming. Each fork is
+# branched from the tag of its published crates.io version — never master — so
+# the patch changes the build script (and, for html/markdown, a C scanner) and
+# nothing about the grammar itself.
+#
+# crate            The crates.io package name. This is what [patch.crates-io] keys on.
+# upstream         Where the grammar actually lives.
+# fork             Our fork. Note it is named after the REPO, which for toml and
+#                  markdown differs from the crate name.
+# tag              Upstream tag our patch currently applies to.
+# patch            File in this directory, named after the repo.
+#
+# crate	upstream	fork	tag	patch
+tree-sitter-rust	tree-sitter/tree-sitter-rust	joeleaver/tree-sitter-rust	v0.24.2	tree-sitter-rust.patch
+tree-sitter-typescript	tree-sitter/tree-sitter-typescript	joeleaver/tree-sitter-typescript	v0.23.2	tree-sitter-typescript.patch
+tree-sitter-javascript	tree-sitter/tree-sitter-javascript	joeleaver/tree-sitter-javascript	v0.25.0	tree-sitter-javascript.patch
+tree-sitter-json	tree-sitter/tree-sitter-json	joeleaver/tree-sitter-json	v0.24.8	tree-sitter-json.patch
+tree-sitter-html	tree-sitter/tree-sitter-html	joeleaver/tree-sitter-html	v0.23.2	tree-sitter-html.patch
+tree-sitter-toml-ng	tree-sitter-grammars/tree-sitter-toml	joeleaver/tree-sitter-toml	v0.7.0	tree-sitter-toml.patch
+tree-sitter-yaml	tree-sitter-grammars/tree-sitter-yaml	joeleaver/tree-sitter-yaml	v0.7.2	tree-sitter-yaml.patch
+tree-sitter-md	tree-sitter-grammars/tree-sitter-markdown	joeleaver/tree-sitter-markdown	v0.5.3	tree-sitter-markdown.patch

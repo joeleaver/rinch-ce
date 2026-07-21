@@ -1,0 +1,73 @@
+diff --git a/tree-sitter-markdown/src/scanner.c b/tree-sitter-markdown/src/scanner.c
+index fda19bd..847c771 100644
+--- a/tree-sitter-markdown/src/scanner.c
++++ b/tree-sitter-markdown/src/scanner.c
+@@ -2,9 +2,28 @@
+ #include <assert.h>
+ #include <ctype.h>
+ #include <string.h>
+-#include <wchar.h>
+ #include <wctype.h>
+ 
++// The freestanding header set used for wasm32-unknown-unknown (shipped by
++// tree-sitter-language) is minimal and declares none of these. Every use below
++// is over ASCII -- ordered-list digits, and an HTML tag name buffer compared
++// against an ASCII table -- so these substitutions are exact. Every other
++// target keeps using the libc implementations.
++#if defined(__wasm32__) && !defined(__wasi__) && !defined(__EMSCRIPTEN__)
++static inline int md_isdigit(int c) { return c >= '0' && c <= '9'; }
++static inline wint_t md_towlower(wint_t wc) {
++    return (wc >= 'A' && wc <= 'Z') ? wc + ('a' - 'A') : wc;
++}
++static inline int md_strcmp(const char *a, const char *b) {
++    while (*a != '\0' && *a == *b) { a++; b++; }
++    return (int)(unsigned char)*a - (int)(unsigned char)*b;
++}
++#else
++#define md_isdigit isdigit
++#define md_towlower towlower
++#define md_strcmp strcmp
++#endif
++
+ // For explanation of the tokens see grammar.js
+ typedef enum {
+     LINE_ENDING,
+@@ -735,9 +754,9 @@ static bool parse_ordered_list_marker(Scanner *s, TSLexer *lexer,
+          valid_symbols[LIST_MARKER_PARENTHESIS_DONT_INTERRUPT] ||
+          valid_symbols[LIST_MARKER_DOT_DONT_INTERRUPT])) {
+         size_t digits = 1;
+-        bool dont_interrupt = !isdigit(lexer->lookahead);
++        bool dont_interrupt = !md_isdigit(lexer->lookahead);
+         advance(s, lexer);
+-        while (isdigit(lexer->lookahead)) {
++        while (md_isdigit(lexer->lookahead)) {
+             dont_interrupt = true;
+             digits++;
+             advance(s, lexer);
+@@ -1008,7 +1027,7 @@ static bool parse_html_block(Scanner *s, TSLexer *lexer,
+     size_t name_length = 0;
+     while (iswalpha((wint_t)lexer->lookahead)) {
+         if (name_length < 10) {
+-            name[name_length++] = (char)towlower((wint_t)lexer->lookahead);
++            name[name_length++] = (char)md_towlower((wint_t)lexer->lookahead);
+         } else {
+             name_length = 12;
+         }
+@@ -1027,7 +1046,7 @@ static bool parse_html_block(Scanner *s, TSLexer *lexer,
+         if (next_symbol_valid) {
+             // try block 1 names
+             for (size_t i = 0; i < NUM_HTML_TAG_NAMES_RULE_1; i++) {
+-                if (strcmp(name, HTML_TAG_NAMES_RULE_1[i]) == 0) {
++                if (md_strcmp(name, HTML_TAG_NAMES_RULE_1[i]) == 0) {
+                     if (starting_slash) {
+                         if (valid_symbols[HTML_BLOCK_1_END]) {
+                             lexer->result_symbol = HTML_BLOCK_1_END;
+@@ -1052,7 +1071,7 @@ static bool parse_html_block(Scanner *s, TSLexer *lexer,
+         if (next_symbol_valid || tag_closed) {
+             // try block 2 names
+             for (size_t i = 0; i < NUM_HTML_TAG_NAMES_RULE_7; i++) {
+-                if (strcmp(name, HTML_TAG_NAMES_RULE_7[i]) == 0 &&
++                if (md_strcmp(name, HTML_TAG_NAMES_RULE_7[i]) == 0 &&
+                     valid_symbols[HTML_BLOCK_6_START]) {
+                     lexer->result_symbol = HTML_BLOCK_6_START;
+                     if (!s->simulate)

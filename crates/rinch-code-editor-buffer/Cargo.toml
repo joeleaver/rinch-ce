@@ -1,0 +1,13 @@
+[package]
+name = "rinch-code-editor-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rope-backed text buffer, multi-cursor selection model, and undo history for the rinch code editor"
+
+[dependencies]
+ropey.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }

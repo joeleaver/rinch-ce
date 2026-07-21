@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+# Listed explicitly rather than globbed, so the remaining crates can be added as
+# their phase lands without a half-written manifest breaking the whole workspace.
+members = [
+    "crates/rinch-code-editor-buffer",
+    "crates/rinch-code-editor-syntax",
+]
+# Web demos carry their own Cargo.lock and wasm-tuned [profile] blocks, and must
+# resolve wgpu/winit straight from crates.io rather than through the desktop
+# forks patched in below. Same reason rinch excludes its own *-web examples.
+exclude = ["examples/code-editor-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/rinch-ce"
+
+[workspace.dependencies]
+# Internal
+rinch-code-editor = { path = "crates/rinch-code-editor" }
+rinch-code-editor-buffer = { path = "crates/rinch-code-editor-buffer" }
+rinch-code-editor-syntax = { path = "crates/rinch-code-editor-syntax" }
+rinch-code-editor-collab = { path = "crates/rinch-code-editor-collab" }
+
+# Rinch (path dependency on the sibling checkout).
+# `default-features = false` mirrors rinch's own workspace: "desktop" is never
+# implicit and must be named explicitly by consumers.
+rinch = { path = "../rinch/crates/rinch", default-features = false }
+rinch-core = { path = "../rinch/crates/rinch-core" }
+
+# Text storage. char- AND line-indexed, no_std-friendly, wasm-clean.
+# char indexing matches automerge's codepoint-indexed Text exactly, so the
+# collab projection needs no offset conversion.
+ropey = "1.6"
+
+# Syntax
+tree-sitter = "0.26.11"
+tree-sitter-highlight = "0.26.11"
+tree-sitter-language = "0.1"
+
+# Grammars. Each is optional and gated behind its own feature in
+# rinch-code-editor-syntax, so a web build only pays for the languages it uses.
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-md = "0.5"
+
+# Collab
+automerge = "0.5"
+
+thiserror = "1"
+
+# Required for desktop builds against rinch: its renderer depends on forked
+# wgpu/winit. Downstream consumers must copy this block verbatim (AGENTS.md).
+#
+# The tree-sitter-* forks add one thing each: the wasm32-unknown-unknown header
+# path that tree-sitter-language already publishes but the grammars never read.
+# Each fork branches from the tag of its published version, so patching changes
+# the build script and nothing about the grammar itself. These retire as the
+# upstream PRs merge.
+[patch.crates-io]
+tree-sitter-rust = { git = "https://github.com/joeleaver/tree-sitter-rust", branch = "wasm32-sysroot" }
+tree-sitter-typescript = { git = "https://github.com/joeleaver/tree-sitter-typescript", branch = "wasm32-sysroot" }
+tree-sitter-javascript = { git = "https://github.com/joeleaver/tree-sitter-javascript", branch = "wasm32-sysroot" }
+tree-sitter-json = { git = "https://github.com/joeleaver/tree-sitter-json", branch = "wasm32-sysroot" }
+tree-sitter-yaml = { git = "https://github.com/joeleaver/tree-sitter-yaml", branch = "wasm32-sysroot" }
+# Repo name differs from crate name for these two.
+tree-sitter-toml-ng = { git = "https://github.com/joeleaver/tree-sitter-toml", branch = "wasm32-sysroot" }
+tree-sitter-md = { git = "https://github.com/joeleaver/tree-sitter-markdown", branch = "wasm32-sysroot" }
+# HTML additionally needed strncpy/towupper replaced; the freestanding headers
+# provide neither. See the fork's commit for why both substitutions are exact.
+tree-sitter-html = { git = "https://github.com/joeleaver/tree-sitter-html", branch = "wasm32-sysroot" }
+# tree-sitter-css needs no fork -- it already builds for wasm32 unmodified.
+wgpu = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-core = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-hal = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-types = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+naga = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+winit = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-core = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }

@@ -1,0 +1,19 @@
+diff --git a/bindings/rust/build.rs b/bindings/rust/build.rs
+index 015ae3c..4d679f3 100644
+--- a/bindings/rust/build.rs
++++ b/bindings/rust/build.rs
+@@ -4,6 +4,14 @@ fn main() {
+     let mut c_config = cc::Build::new();
+     c_config.std("c11").include(src_dir);
+ 
++    // wasm32-unknown-unknown has no libc, so <stdlib.h> and friends are absent
++    // and the grammar fails to compile. tree-sitter-language already ships a
++    // freestanding header set for this target and exports its path as build
++    // metadata; pick it up when it is available.
++    if let Ok(wasm_headers) = std::env::var("DEP_TREE_SITTER_LANGUAGE_WASM_HEADERS") {
++        c_config.include(wasm_headers);
++    }
++
+     #[cfg(target_env = "msvc")]
+     c_config.flag("-utf-8");
+ 

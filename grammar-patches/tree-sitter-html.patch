@@ -1,0 +1,72 @@
+diff --git a/bindings/rust/build.rs b/bindings/rust/build.rs
+index 6551aef..c24785a 100644
+--- a/bindings/rust/build.rs
++++ b/bindings/rust/build.rs
+@@ -8,6 +8,14 @@ fn main() {
+         .flag_if_supported("-Wno-sign-compare")
+         .flag_if_supported("-Wno-implicit-fallthrough");
+ 
++    // wasm32-unknown-unknown has no libc, so <stdlib.h> and friends are absent
++    // and the grammar fails to compile. tree-sitter-language already ships a
++    // freestanding header set for this target and exports its path as build
++    // metadata; pick it up when it is available.
++    if let Ok(wasm_headers) = std::env::var("DEP_TREE_SITTER_LANGUAGE_WASM_HEADERS") {
++        c_config.include(wasm_headers);
++    }
++
+     #[cfg(target_env = "msvc")]
+     c_config.flag("-utf-8");
+ 
+diff --git a/src/scanner.c b/src/scanner.c
+index eecef9a..ad1d2ed 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -1,8 +1,21 @@
+ #include "tag.h"
+ #include "tree_sitter/parser.h"
+ 
++#include <string.h>
+ #include <wctype.h>
+ 
++// The freestanding header set used for wasm32-unknown-unknown (shipped by
++// tree-sitter-language) provides no towupper. Both uses below fold ASCII only
++// -- tag names and the script/style end delimiters -- so an ASCII fold is
++// exact here. Every other target keeps using the libc implementation.
++#if defined(__wasm32__) && !defined(__wasi__) && !defined(__EMSCRIPTEN__)
++static inline wint_t html_towupper(wint_t wc) {
++    return (wc >= 'a' && wc <= 'z') ? wc - ('a' - 'A') : wc;
++}
++#else
++#define html_towupper towupper
++#endif
++
+ enum TokenType {
+     START_TAG_NAME,
+     SCRIPT_START_TAG_NAME,
+@@ -45,7 +58,7 @@ static unsigned serialize(Scanner *scanner, char *buffer) {
+             }
+             buffer[size++] = (char)tag.type;
+             buffer[size++] = (char)name_length;
+-            strncpy(&buffer[size], tag.custom_tag_name.contents, name_length);
++            memcpy(&buffer[size], tag.custom_tag_name.contents, name_length);
+             size += name_length;
+         } else {
+             if (size + 1 >= TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
+@@ -103,7 +116,7 @@ static void deserialize(Scanner *scanner, const char *buffer, unsigned length) {
+ static String scan_tag_name(TSLexer *lexer) {
+     String tag_name = array_new();
+     while (iswalnum(lexer->lookahead) || lexer->lookahead == '-' || lexer->lookahead == ':') {
+-        array_push(&tag_name, towupper(lexer->lookahead));
++        array_push(&tag_name, html_towupper(lexer->lookahead));
+         advance(lexer);
+     }
+     return tag_name;
+@@ -151,7 +164,7 @@ static bool scan_raw_text(Scanner *scanner, TSLexer *lexer) {
+ 
+     unsigned delimiter_index = 0;
+     while (lexer->lookahead) {
+-        if (towupper(lexer->lookahead) == end_delimiter[delimiter_index]) {
++        if (html_towupper(lexer->lookahead) == end_delimiter[delimiter_index]) {
+             delimiter_index++;
+             if (delimiter_index == strlen(end_delimiter)) {
+                 break;

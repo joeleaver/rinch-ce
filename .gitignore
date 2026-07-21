@@ -1,0 +1,22 @@
+# Build artifacts
+/target
+**/target/
+**/dist/
+
+# Rust
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI tools
+.claude/*
+!.claude/settings.json
+.mcp.json
+
+# OS
+.DS_Store
+Thumbs.db

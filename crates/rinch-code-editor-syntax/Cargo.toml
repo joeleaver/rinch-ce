@@ -1,0 +1,57 @@
+[package]
+name = "rinch-code-editor-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Syntax highlighting for the rinch code editor: Monaco-compatible packed tokens, themes, and an optional tree-sitter backend"
+
+[dependencies]
+rinch-code-editor-buffer.workspace = true
+ropey.workspace = true
+
+# The tree-sitter backend. Off by default so a consumer that only wants plain
+# text — or supplies its own Highlighter — links no C code at all.
+tree-sitter = { workspace = true, optional = true }
+streaming-iterator = { version = "0.1", optional = true }
+
+# Grammars. Each costs a few hundred KB gzipped in a web build, so none is
+# implied by `tree-sitter` — a consumer opts into exactly the languages it needs.
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-html = { workspace = true, optional = true }
+tree-sitter-css = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
+
+[features]
+default = []
+tree-sitter = ["dep:tree-sitter", "dep:streaming-iterator"]
+
+lang-rust = ["tree-sitter", "dep:tree-sitter-rust"]
+lang-typescript = ["tree-sitter", "dep:tree-sitter-typescript"]
+lang-javascript = ["tree-sitter", "dep:tree-sitter-javascript"]
+lang-html = ["tree-sitter", "dep:tree-sitter-html"]
+lang-css = ["tree-sitter", "dep:tree-sitter-css"]
+lang-json = ["tree-sitter", "dep:tree-sitter-json"]
+lang-toml = ["tree-sitter", "dep:tree-sitter-toml-ng"]
+lang-yaml = ["tree-sitter", "dep:tree-sitter-yaml"]
+lang-markdown = ["tree-sitter", "dep:tree-sitter-md"]
+
+all-languages = [
+    "lang-rust",
+    "lang-typescript",
+    "lang-javascript",
+    "lang-html",
+    "lang-css",
+    "lang-json",
+    "lang-toml",
+    "lang-yaml",
+    "lang-markdown",
+]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
