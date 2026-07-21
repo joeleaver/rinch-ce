@@ -116,6 +116,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rinch-code-editor-model"
+version = "0.1.0"
+dependencies = [
+ "rinch-code-editor-buffer",
+ "rinch-code-editor-syntax",
+]
+
+[[package]]
 name = "rinch-code-editor-syntax"
 version = "0.1.0"
 dependencies = [

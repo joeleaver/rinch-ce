@@ -1,0 +1,17 @@
+[package]
+name = "rinch-code-editor-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The editor model: orchestrates the buffer, selections, undo history, and highlighter behind one edit API, with no dependency on rinch or a renderer"
+
+[dependencies]
+rinch-code-editor-buffer.workspace = true
+# Only the highlighter trait and token/theme types are needed here, so the
+# default (empty) feature set is right: the model pulls in no tree-sitter and no
+# grammars. The view crate turns those on.
+rinch-code-editor-syntax.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }

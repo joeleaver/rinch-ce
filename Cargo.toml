@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/rinch-code-editor-buffer",
     "crates/rinch-code-editor-syntax",
+    "crates/rinch-code-editor-model",
 ]
 # Web demos carry their own Cargo.lock and wasm-tuned [profile] blocks, and must
 # resolve wgpu/winit straight from crates.io rather than through the desktop
@@ -22,6 +23,7 @@ repository = "https://github.com/joeleaver/rinch-ce"
 rinch-code-editor = { path = "crates/rinch-code-editor" }
 rinch-code-editor-buffer = { path = "crates/rinch-code-editor-buffer" }
 rinch-code-editor-syntax = { path = "crates/rinch-code-editor-syntax" }
+rinch-code-editor-model = { path = "crates/rinch-code-editor-model" }
 rinch-code-editor-collab = { path = "crates/rinch-code-editor-collab" }
 
 # Rinch (path dependency on the sibling checkout).
