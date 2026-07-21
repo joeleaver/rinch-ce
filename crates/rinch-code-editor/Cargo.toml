@@ -1,0 +1,21 @@
+[package]
+name = "rinch-code-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A Monaco-parity code editor component for the rinch GUI framework"
+
+[dependencies]
+# rinch is a PEER dependency: default-features off, no backend. The editor links
+# no renderer or windowing of its own — the consuming application chooses
+# `desktop`/`gpu` or brings `rinch-web`, and owns the `[patch.crates-io]` block
+# rinch's desktop build needs. See README.md ("rinch is a peer dependency").
+# The facade re-exports `rinch::core` (= rinch-core) and the `rsx!`/`component`
+# macros unconditionally, so `rsx!` resolves with no shim and no backend feature.
+rinch = { workspace = true }
+
+rinch-code-editor-model.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }

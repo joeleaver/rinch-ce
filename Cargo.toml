@@ -6,6 +6,8 @@ members = [
     "crates/rinch-code-editor-buffer",
     "crates/rinch-code-editor-syntax",
     "crates/rinch-code-editor-model",
+    "crates/rinch-code-editor",
+    "examples/desktop-demo",
 ]
 # Web demos carry their own Cargo.lock and wasm-tuned [profile] blocks, and must
 # resolve wgpu/winit straight from crates.io rather than through the desktop

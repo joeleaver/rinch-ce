@@ -1,0 +1,12 @@
+[package]
+name = "rinch-code-editor-desktop-demo"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# The example is the *consumer* in the peer-dependency story: it is what turns
+# on a backend. It enables rinch's `desktop` feature (the library never does) and
+# `debug` (so the rinch MCP debug server can attach for screenshots/input).
+[dependencies]
+rinch = { workspace = true, features = ["desktop", "debug"] }
+rinch-code-editor.workspace = true

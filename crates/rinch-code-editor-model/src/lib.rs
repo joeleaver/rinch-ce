@@ -47,8 +47,13 @@ pub use geometry::Grid;
 pub use model::{EditKind, EditSummary, EditorModel};
 
 // Re-export the foundation types a caller needs to drive the model, so a
-// downstream view can depend on this one crate for the editing surface.
+// downstream view can depend on this one crate for the whole editing surface —
+// the editing types from the buffer crate, and the highlighting/token/theme
+// types a renderer consumes from the syntax crate.
 pub use rinch_code_editor_buffer::{
     Bias, Buffer, Change, Edit, History, Position, Selection, Selections,
 };
-pub use rinch_code_editor_syntax::{Highlighter, LineTokens, Theme};
+pub use rinch_code_editor_syntax::{
+    ColorId, FontStyle, Highlighter, LineTokens, PlainHighlighter, Rgba, Style, Theme,
+    TokenMetadata, TokenSpan,
+};
