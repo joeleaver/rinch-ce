@@ -37,9 +37,12 @@
 //! consequence of an edit; asking it to move the caret one column left is the
 //! view layer's job, because that needs the visual line model the view builds.
 
+mod cursor;
 mod geometry;
+mod graphemes;
 mod model;
 
+pub use cursor::Motion;
 pub use geometry::Grid;
 pub use model::{EditKind, EditSummary, EditorModel};
 

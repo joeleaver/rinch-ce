@@ -41,6 +41,10 @@ ropey = "1.6"
 # cells, combining marks zero. Pure tables, no_std, wasm-clean.
 unicode-width = "0.2"
 
+# Grapheme-cluster segmentation so the caret and delete step over a \r\n or a
+# base+combining-mark as one user-perceived character. Pure, wasm-clean.
+unicode-segmentation = "1"
+
 # Syntax
 tree-sitter = "0.26.11"
 tree-sitter-highlight = "0.26.11"

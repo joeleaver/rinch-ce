@@ -3,6 +3,10 @@ use std::ops::Range;
 use rinch_code_editor_buffer::{Buffer, Change, Edit, History, Selection, Selections};
 use rinch_code_editor_syntax::{Highlighter, LineTokens, Theme};
 
+use crate::cursor::{self, Motion};
+use crate::geometry::Grid;
+use crate::graphemes;
+
 /// What produced an [`EditSummary`]. The view uses this to decide, for instance,
 /// whether to scroll the primary caret into view (yes on an edit, yes on undo).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,16 +176,17 @@ impl EditorModel {
     }
 
     /// Delete the selection at each cursor, or — when the cursor is empty — the
-    /// character before it. Consecutive backspaces coalesce into one undo step.
+    /// grapheme before it. Consecutive backspaces coalesce into one undo step.
+    /// Stepping by grapheme means a `\r\n` or a base-plus-combining-mark is
+    /// removed as the one character the user sees, not as a fragment of it.
     pub fn backspace(&mut self) -> Option<EditSummary> {
         let coalesce = self.coalesce == CoalesceKind::Deleting;
-        let summary = self.apply_cursor_edits(EditKind::Delete, coalesce, |sel, _buffer| {
+        let summary = self.apply_cursor_edits(EditKind::Delete, coalesce, |sel, buffer| {
             if !sel.is_empty() {
                 Some((sel.range(), String::new()))
-            } else if sel.head > 0 {
-                Some((sel.head - 1..sel.head, String::new()))
             } else {
-                None
+                let prev = graphemes::prev_boundary(buffer, sel.head);
+                (prev < sel.head).then(|| (prev..sel.head, String::new()))
             }
         })?;
         self.coalesce = CoalesceKind::Deleting;
@@ -189,21 +194,31 @@ impl EditorModel {
     }
 
     /// Delete the selection at each cursor, or — when the cursor is empty — the
-    /// character after it. Consecutive forward-deletes coalesce.
+    /// grapheme after it. Consecutive forward-deletes coalesce.
     pub fn delete_forward(&mut self) -> Option<EditSummary> {
         let coalesce = self.coalesce == CoalesceKind::Deleting;
-        let len = self.buffer.len_chars();
-        let summary = self.apply_cursor_edits(EditKind::Delete, coalesce, |sel, _buffer| {
+        let summary = self.apply_cursor_edits(EditKind::Delete, coalesce, |sel, buffer| {
             if !sel.is_empty() {
                 Some((sel.range(), String::new()))
-            } else if sel.head < len {
-                Some((sel.head..sel.head + 1, String::new()))
             } else {
-                None
+                let next = graphemes::next_boundary(buffer, sel.head);
+                (next > sel.head).then(|| (sel.head..next, String::new()))
             }
         })?;
         self.coalesce = CoalesceKind::Deleting;
         Some(summary)
+    }
+
+    // ---- cursor motion (no text change) ----------------------------------
+
+    /// Move every cursor by `motion`. With `extend` the selection grows (shift
+    /// held); without it each selection collapses onto its new caret. `grid`
+    /// supplies the visual-column geometry that vertical motion needs to hold its
+    /// on-screen column; other motions ignore it. Like any caret move, this ends
+    /// the open undo group.
+    pub fn move_cursors(&mut self, grid: &Grid, motion: Motion, extend: bool) {
+        let moved = cursor::move_cursors(&self.buffer, grid, &self.selections, motion, extend);
+        self.set_selections(moved);
     }
 
     // ---- history ----------------------------------------------------------
