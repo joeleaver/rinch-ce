@@ -37,6 +37,10 @@ rinch-core = { path = "../rinch/crates/rinch-core" }
 # collab projection needs no offset conversion.
 ropey = "1.6"
 
+# Unicode display width for the monospace grid: full-width (CJK) glyphs are two
+# cells, combining marks zero. Pure tables, no_std, wasm-clean.
+unicode-width = "0.2"
+
 # Syntax
 tree-sitter = "0.26.11"
 tree-sitter-highlight = "0.26.11"
