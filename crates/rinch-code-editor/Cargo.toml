@@ -17,5 +17,27 @@ rinch = { workspace = true }
 
 rinch-code-editor-model.workspace = true
 
+# Language support is forwarded, feature-for-feature, to the model crate (which
+# forwards to the syntax crate). Turning on `lang-rust` here compiles the Rust
+# grammar in and makes `language: "rust"` highlight; a build with none of these
+# links no tree-sitter and no C, and `CodeEditor` falls back to plain text. This
+# is the lean Joe approved: no runtime grammar loading, no dynamic registry —
+# the set of languages is a compile-time decision the consuming app owns.
+[features]
+default = []
+tree-sitter = ["rinch-code-editor-model/tree-sitter"]
+
+lang-rust = ["tree-sitter", "rinch-code-editor-model/lang-rust"]
+lang-typescript = ["tree-sitter", "rinch-code-editor-model/lang-typescript"]
+lang-javascript = ["tree-sitter", "rinch-code-editor-model/lang-javascript"]
+lang-html = ["tree-sitter", "rinch-code-editor-model/lang-html"]
+lang-css = ["tree-sitter", "rinch-code-editor-model/lang-css"]
+lang-json = ["tree-sitter", "rinch-code-editor-model/lang-json"]
+lang-toml = ["tree-sitter", "rinch-code-editor-model/lang-toml"]
+lang-yaml = ["tree-sitter", "rinch-code-editor-model/lang-yaml"]
+lang-markdown = ["tree-sitter", "rinch-code-editor-model/lang-markdown"]
+
+all-languages = ["tree-sitter", "rinch-code-editor-model/all-languages"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }

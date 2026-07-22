@@ -9,4 +9,6 @@ publish = false
 # `debug` (so the rinch MCP debug server can attach for screenshots/input).
 [dependencies]
 rinch = { workspace = true, features = ["desktop", "debug"] }
-rinch-code-editor.workspace = true
+# The sample document is Rust, so the consumer compiles the Rust grammar in. This
+# is the only place a language is chosen — the library ships none by default.
+rinch-code-editor = { workspace = true, features = ["lang-rust"] }

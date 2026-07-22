@@ -22,6 +22,7 @@ fn app() -> NodeHandle {
                 style: "width:100%; height:100%; border:1px solid #000; border-radius:6px; overflow:hidden;",
                 CodeEditor {
                     text: SAMPLE.to_string(),
+                    language: "rust",
                 }
             }
         }

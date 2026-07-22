@@ -10,10 +10,32 @@ description = "The editor model: orchestrates the buffer, selections, undo histo
 rinch-code-editor-buffer.workspace = true
 # Only the highlighter trait and token/theme types are needed here, so the
 # default (empty) feature set is right: the model pulls in no tree-sitter and no
-# grammars. The view crate turns those on.
+# grammars. A consumer that wants real highlighting turns on the language
+# features below, which forward straight to the syntax crate.
 rinch-code-editor-syntax.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+
+# The model exposes highlighting purely as pass-throughs to the syntax crate: it
+# adds no highlighting logic of its own. Each `lang-*` feature also turns on the
+# model's own `tree-sitter` feature so the cfg-gated re-exports (TreeSitterHighlighter,
+# languages, …) light up in lockstep with the grammar being compiled in — the same
+# shape the syntax crate uses one layer down. A build with none of these links no C.
+[features]
+default = []
+tree-sitter = ["rinch-code-editor-syntax/tree-sitter"]
+
+lang-rust = ["tree-sitter", "rinch-code-editor-syntax/lang-rust"]
+lang-typescript = ["tree-sitter", "rinch-code-editor-syntax/lang-typescript"]
+lang-javascript = ["tree-sitter", "rinch-code-editor-syntax/lang-javascript"]
+lang-html = ["tree-sitter", "rinch-code-editor-syntax/lang-html"]
+lang-css = ["tree-sitter", "rinch-code-editor-syntax/lang-css"]
+lang-json = ["tree-sitter", "rinch-code-editor-syntax/lang-json"]
+lang-toml = ["tree-sitter", "rinch-code-editor-syntax/lang-toml"]
+lang-yaml = ["tree-sitter", "rinch-code-editor-syntax/lang-yaml"]
+lang-markdown = ["tree-sitter", "rinch-code-editor-syntax/lang-markdown"]
+
+all-languages = ["tree-sitter", "rinch-code-editor-syntax/all-languages"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }

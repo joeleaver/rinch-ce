@@ -57,3 +57,10 @@ pub use rinch_code_editor_syntax::{
     ColorId, FontStyle, Highlighter, LineTokens, PlainHighlighter, Rgba, Style, Theme,
     TokenMetadata, TokenSpan,
 };
+
+// The tree-sitter surface — the concrete highlighter, the bundled-language
+// registry, and its error type — is forwarded only when a `lang-*` feature is
+// on, mirroring the syntax crate's own gating. A view crate can then build a
+// real highlighter through this one dependency without naming the syntax crate.
+#[cfg(feature = "tree-sitter")]
+pub use rinch_code_editor_syntax::{LanguageConfig, SyntaxError, TreeSitterHighlighter, languages};

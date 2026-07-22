@@ -3,144 +3,144 @@
 //! rinch is a *peer* dependency, not something this crate bundles — see the
 //! crate README for why that is a diamond and not a cycle. Everything hard lives
 //! in the three rinch-free crates below this one; here we only turn the
-//! [`EditorModel`] into DOM.
+//! [`EditorModel`] into DOM and drive it from the keyboard.
 //!
-//! # Status: Increment 4b — overlays
+//! # Status: Increment 4c — live editing
 //!
-//! On top of the static render (4a), this adds the three grid-positioned overlay
-//! layers a real editor needs: a current-line band behind everything, selection
-//! rectangles behind the glyphs, and the caret in front. Their horizontal
-//! placement needs the pixel advance of one character, which — unlike line
-//! height, which we set ourselves — must be *measured*, since it differs between
-//! the desktop (Parley) and web backends. We measure it once from a hidden probe
-//! element via [`NodeHandle::bounds_signal`], and the overlay positions recompute
-//! reactively the moment that measurement lands.
+//! The editor is now interactive. Three things landed on top of the read-only
+//! overlays of 4b:
 //!
-//! Still read-only: a seed cursor+selection makes the layers visible. Keyboard
-//! input (4c) will drive them from real edits and motion.
+//! - **Live state.** The document is an `Rc<RefCell<EditorModel>>` behind a
+//!   `version` [`Signal`] that bumps on every change. Every row and overlay is
+//!   produced inside a reactive closure that reads that signal, so one keystroke
+//!   repaints exactly what moved and nothing else — the render is a pure function
+//!   of the version, and rinch's keyed reconciliation does the diffing.
+//! - **Keyboard.** A single global interceptor (rinch has no per-element key
+//!   handler) drives the model — arrows and their word/line/document variants,
+//!   selection with Shift, insert/delete, Enter, Tab, and undo/redo — gated on a
+//!   focus flag the editor sets when clicked. See [`mod@input`].
+//! - **Real highlighting.** When a grammar is compiled in (a `lang-*` feature),
+//!   the `language` prop selects a tree-sitter backend; otherwise the editor
+//!   falls back to plain text. See [`mod@highlight`].
+//!
+//! Still to come: click-to-place-caret hit testing, and viewport virtualization
+//! (4d) so the whole-document walks in [`mod@render`] become viewport slices.
+
+mod highlight;
+mod input;
+mod render;
+mod styles;
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use rinch::prelude::*;
-use rinch_code_editor_model::{
-    EditorModel, Grid, Highlighter, PlainHighlighter, Rgba, Selection, Selections, Theme,
-    TokenMetadata,
+use rinch_code_editor_model::{EditorModel, Grid};
+
+use styles::{
+    EDITOR_STYLE, FALLBACK_CELL_WIDTH, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, TAB_SIZE, VIEW_STYLE,
+    caret_style, current_line_style, gutter_style, layers_style, line_style, number_style,
+    sel_rect_style,
 };
 
-/// Line box height in pixels. We own this (it is the CSS `line-height` below), so
-/// vertical positioning needs no measurement.
-const LINE_HEIGHT: f32 = 20.0;
-/// Gutter width in pixels. Wide enough for four digits at the current metrics.
-const GUTTER_WIDTH: f32 = 52.0;
-/// Left padding of the text area, shared by the text rows and the overlay layers
-/// so glyphs and their caret/selection line up.
-const TEXT_PAD_LEFT: f32 = 8.0;
-/// Grid columns per tab stop.
-const TAB_SIZE: usize = 4;
-/// Caret bar width in pixels.
-const CARET_WIDTH: f32 = 2.0;
-/// Characters in the measurement probe; its width / this = one cell's advance.
-const PROBE_LEN: usize = 10;
-/// Cell width used before the probe has been measured (roughly DejaVu Sans Mono
-/// at 14px); the real value snaps in on the first layout pass.
-const FALLBACK_CELL_WIDTH: f32 = 8.4;
-
-/// One coloured run within a rendered line.
-#[derive(Clone, PartialEq)]
-struct Seg {
-    key: usize,
-    text: String,
-    color: String,
-}
-
-/// A line prepared for rendering: its 1-based number, its pixel top, and its
-/// coloured segments.
-#[derive(Clone, PartialEq)]
-struct LineRender {
-    number: usize,
-    top: f32,
-    segs: Vec<Seg>,
-}
-
-/// A gutter row: just the number and where it sits.
-#[derive(Clone, PartialEq)]
-struct GutterRow {
-    number: usize,
-    top: f32,
-}
-
-/// One selection rectangle, in grid coordinates (visual columns). The pixel width
-/// is applied reactively once the cell advance is measured.
-#[derive(Clone, Copy, PartialEq)]
-struct SelRect {
-    key: usize,
-    line: usize,
-    start_vcol: usize,
-    end_vcol: usize,
-}
-
-/// Everything the overlay layers need, in grid coordinates.
-struct Overlays {
-    caret_line: usize,
-    caret_vcol: usize,
-    current_line: usize,
-    sel_rects: Vec<SelRect>,
-}
-
-/// The editor component. `text` is the initial document.
+/// The editor component. `text` is the initial document; `language` names a
+/// bundled grammar (e.g. `"rust"`) — an empty or not-compiled-in language renders
+/// as plain text.
 #[component]
-pub fn CodeEditor(text: String) -> NodeHandle {
-    let theme = dark_theme();
+pub fn CodeEditor(text: String, language: String) -> NodeHandle {
+    // Build the theme, read the default foreground off it (the fallback colour for
+    // an unstyled token), then hand the theme to the highlighter it colours through.
+    let theme = highlight::dark_theme();
     let default_color = theme
         .color(theme.default_metadata().foreground())
         .map(|c| c.to_css())
         .unwrap_or_else(|| "#d4d4d4".to_string());
+    let highlighter = highlight::make_highlighter(&language, theme);
 
-    let highlighter: Box<dyn Highlighter> = Box::new(PlainHighlighter::new(theme));
-    let mut model = EditorModel::from_text(&text, highlighter);
+    // The one owner of the document. `RefCell` because the keyboard interceptor
+    // and the render effects both reach it; `Rc` because they outlive this call.
+    let model = Rc::new(RefCell::new(EditorModel::from_text(&text, highlighter)));
 
-    // 4b: seed a caret + selection so the overlay layers are visible in the
-    // read-only demo. Keyboard input (4c) replaces this with live editing.
-    if let Some(sel) = demo_selection(&text) {
-        model.set_selections(Selections::single(sel));
-    }
-
-    // A grid whose cell width is a placeholder (1.0): visual_column counts grid
-    // cells and is independent of pixel width, which the overlays multiply in
-    // reactively after measurement.
+    // The grid's cell width is a placeholder (1.0): visual columns are counted in
+    // cells, independent of pixels, and the overlays multiply the measured cell
+    // advance in reactively after layout.
     let grid = Grid::new(1.0, LINE_HEIGHT, TAB_SIZE);
 
-    let line_count = model.len_lines();
-    let lines = compute_lines(&mut model, &default_color);
-    let gutter: Vec<GutterRow> = (0..line_count)
-        .map(|i| GutterRow {
-            number: i + 1,
-            top: i as f32 * LINE_HEIGHT,
-        })
-        .collect();
-    let overlays = compute_overlays(&model, &grid);
-    let content_height = line_count as f32 * LINE_HEIGHT;
+    // `version` bumps on every model change; every reactive closure below reads it,
+    // so one keystroke repaints exactly the rows and overlays that moved. `focused`
+    // gates the keyboard interceptor so keys only reach us while the editor is active.
+    let version = Signal::new(0u64);
+    let focused = Signal::new(false);
+    input::install(model.clone(), grid, version, focused);
 
-    let caret_line = overlays.caret_line;
-    let caret_vcol = overlays.caret_vcol;
-    let current_line = overlays.current_line;
-    let sel_rects = overlays.sel_rects;
-
-    // A hidden probe of known length. Its measured width, divided by its length,
-    // is the advance of one monospace cell. bounds_signal refreshes after each
-    // layout pass, so reading it in the overlay closures makes them self-correct.
+    // A hidden probe of known length: its measured width divided by its length is
+    // the advance of one monospace cell.
     let probe = __scope.create_element("span");
     probe.set_attribute("style", PROBE_STYLE);
     let probe_text = __scope.create_text(&"0".repeat(PROBE_LEN));
     probe.append_child(&probe_text);
-    let probe_bounds = probe.bounds_signal();
+
+    // Derived overlay state, as memos. Each captures the model (or the probe)
+    // *once* and recomputes when `version` bumps; the style closures below then
+    // read them — a `Memo` is `Copy`, so nothing non-`Copy` is moved inside an
+    // effect the macro re-evaluates on every run (a plain model or node handle
+    // would not survive that). The `for` loops, by contrast, capture the model
+    // once and only borrow it, so they reference `model` directly and the macro
+    // clones it per loop.
+    //
+    // `cell_w` measures the probe *synchronously* (`client_width`) rather than
+    // subscribing to its `bounds_signal`. That is deliberate and load-bearing: a
+    // bounds-signal subscriber re-runs during paint, inside the document's read
+    // borrow (see rinch's `update_bounds_signals`), and setting a style attribute
+    // there re-enters the borrow and panics. Keying the measurement on `version`
+    // instead means it only re-runs from the keyboard path, where the document is
+    // free — and the probe's width does not depend on the document anyway, so
+    // measuring it on edits (not on every layout) loses nothing. Before the first
+    // layout `client_width` is 0 and the fallback stands in; the caret sits at
+    // column 0 then, where the cell width does not matter.
+    let cell_w = Memo::new({
+        let p = probe.clone();
+        move || {
+            version.get();
+            let w = p.client_width() as f32;
+            if w > 0.0 {
+                w / PROBE_LEN as f32
+            } else {
+                FALLBACK_CELL_WIDTH
+            }
+        }
+    });
+    let content_h = Memo::new({
+        let m = model.clone();
+        move || {
+            version.get();
+            render::content_height(&m.borrow())
+        }
+    });
+    let current_line = Memo::new({
+        let m = model.clone();
+        move || {
+            version.get();
+            render::caret_line(&m.borrow())
+        }
+    });
+    let caret = Memo::new({
+        let m = model.clone();
+        move || {
+            version.get();
+            render::caret_grid(&m.borrow(), &grid)
+        }
+    });
 
     rsx! {
         div {
             style: EDITOR_STYLE,
+            onmousedown: move || focused.set(true),
 
-            // Gutter.
+            // Gutter — its rows track the line count.
             div {
                 style: gutter_style(),
-                for row in gutter.clone() {
+                for row in gutter_rows(version, &model) {
                     div {
                         key: row.number,
                         style: number_style(row.top),
@@ -150,29 +150,32 @@ pub fn CodeEditor(text: String) -> NodeHandle {
             }
 
             // Text view: a scroll container whose layer stack is sized to the full
-            // document. Children are z-ordered: current-line band, selection,
-            // text, caret.
+            // document. Children are z-ordered: current-line band, selection, text,
+            // caret.
             div {
                 style: VIEW_STYLE,
                 div {
-                    style: layers_style(content_height),
+                    style: { move || layers_style(content_h.get()) },
 
                     // Current-line band (z 0) — full width, no measurement needed.
-                    div { style: current_line_style(current_line) }
+                    div {
+                        style: { move || current_line_style(current_line.get()) },
+                    }
 
                     // Selection rectangles (z 1) — behind the glyphs.
-                    for rect in sel_rects.clone() {
+                    for rect in selection_rects(version, &model, grid) {
                         div {
                             key: rect.key,
                             style: {
-                                let pb = probe_bounds;
-                                move || sel_rect_style(rect, cell_width(pb))
+                                move || {
+                                    sel_rect_style(rect.line, rect.start_vcol, rect.end_vcol, cell_w.get())
+                                }
                             },
                         }
                     }
 
                     // Text rows (z 2).
-                    for line in lines.clone() {
+                    for line in text_rows(version, &model, &default_color) {
                         div {
                             key: line.number,
                             style: line_style(line.top),
@@ -189,8 +192,10 @@ pub fn CodeEditor(text: String) -> NodeHandle {
                     // Caret (z 3) — in front of the text.
                     div {
                         style: {
-                            let pb = probe_bounds;
-                            move || caret_style(caret_line, caret_vcol, cell_width(pb))
+                            move || {
+                                let (line, vcol) = caret.get();
+                                caret_style(line, vcol, cell_w.get())
+                            }
                         },
                     }
 
@@ -202,193 +207,32 @@ pub fn CodeEditor(text: String) -> NodeHandle {
     }
 }
 
-/// Cell advance in pixels from the probe's measured bounds, with a fallback until
-/// the first layout pass has produced a real measurement.
-fn cell_width(probe_bounds: Signal<rinch::core::reactive::ElementBounds>) -> f32 {
-    let width = probe_bounds.get().width;
-    if width > 0.0 {
-        width / PROBE_LEN as f32
-    } else {
-        FALLBACK_CELL_WIDTH
-    }
-}
-
-/// Turn the model into per-line render data: each line's char text is sliced by
-/// its token spans and each span coloured from the theme palette.
-fn compute_lines(model: &mut EditorModel, default_color: &str) -> Vec<LineRender> {
-    let line_count = model.len_lines();
-    let mut out = Vec::with_capacity(line_count);
-    for i in 0..line_count {
-        let chars: Vec<char> = model.buffer().line_text(i).chars().collect();
-        let tokens = model.line_tokens(i);
-        let theme = model.theme();
-
-        let mut segs = Vec::new();
-        for (k, span) in tokens.iter().enumerate() {
-            let start = span.start as usize;
-            let end = (span.end as usize).min(chars.len());
-            if start >= end {
-                continue;
-            }
-            segs.push(Seg {
-                key: k,
-                text: chars[start..end].iter().collect(),
-                color: color_of(theme, span.metadata, default_color),
-            });
-        }
-        out.push(LineRender {
-            number: i + 1,
-            top: i as f32 * LINE_HEIGHT,
-            segs,
-        });
-    }
-    out
-}
-
-/// Compute the caret, current-line, and selection geometry from the model's
-/// selections, all in grid coordinates (visual columns).
-fn compute_overlays(model: &EditorModel, grid: &Grid) -> Overlays {
-    let buffer = model.buffer();
-    let selections = model.selections();
-
-    let head = buffer.position_of(selections.primary().head);
-    let head_line_text = buffer.line_text(head.line);
-    let caret_vcol = grid.visual_column(&head_line_text, head.col);
-
-    let mut sel_rects = Vec::new();
-    let mut key = 0;
-    for sel in selections.iter() {
-        if sel.is_empty() {
-            continue;
-        }
-        let start = buffer.position_of(sel.start());
-        let end = buffer.position_of(sel.end());
-        for line in start.line..=end.line {
-            let line_text = buffer.line_text(line);
-            let content_len = buffer.line_len(line);
-            let s_col = if line == start.line { start.col } else { 0 };
-            let e_col = if line == end.line {
-                end.col
-            } else {
-                content_len
-            };
-            let start_vcol = grid.visual_column(&line_text, s_col);
-            let mut end_vcol = grid.visual_column(&line_text, e_col);
-            // A line whose terminator is inside the selection shows a sliver past
-            // its content, so a selected line break reads as selected.
-            if line < end.line {
-                end_vcol += 1;
-            }
-            sel_rects.push(SelRect {
-                key,
-                line,
-                start_vcol,
-                end_vcol,
-            });
-            key += 1;
-        }
-    }
-
-    Overlays {
-        caret_line: head.line,
-        caret_vcol,
-        current_line: head.line,
-        sel_rects,
-    }
-}
-
-/// A token's foreground as a CSS colour, falling back to the editor default when
-/// the token carries no explicit colour (an unset palette slot).
-fn color_of(theme: &Theme, metadata: TokenMetadata, default: &str) -> String {
-    theme
-        .color(metadata.foreground())
-        .map(|c| c.to_css())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// The placeholder dark theme. Colours become configurable — and come from a
-/// real syntax highlighter — in a later increment; the palette is data, not code.
-fn dark_theme() -> Theme {
-    Theme::builder()
-        .default_foreground(Rgba::rgb(0xd4, 0xd4, 0xd4))
-        .build()
-}
-
-/// Find a demonstration selection in the sample text (the first `greeting`), so
-/// the read-only 4b build shows a caret and a selection.
-fn demo_selection(text: &str) -> Option<Selection> {
-    let byte = text.find("greeting")?;
-    let start = text[..byte].chars().count();
-    let end = start + "greeting".chars().count();
-    Some(Selection::new(start, end))
-}
-
-// ---- styles --------------------------------------------------------------
+// ---- reactive reads --------------------------------------------------------
 //
-// Inline styles for now. When rinch stylesheet injection is wired in, these
-// collapse to class names; the structure does not change.
+// Each of these reads `version` — establishing the reactive dependency — then
+// returns freshly-computed render data. They exist as named functions rather
+// than inline blocks because an rsx `for`'s iterator is parsed only up to the
+// first `{`, so its expression cannot itself be a block; a call is unambiguous.
 
-const EDITOR_STYLE: &str = "position:relative; display:flex; width:100%; height:100%; \
-    overflow:hidden; background:#1e1e1e; color:#d4d4d4; \
-    font-family:'DejaVu Sans Mono','Cascadia Mono',monospace; font-size:14px; \
-    line-height:20px; font-variant-ligatures:none;";
-
-const VIEW_STYLE: &str = "position:relative; flex:1 1 auto; overflow:auto;";
-
-// Positioned far off to the left so it is laid out and measured (bounds_signal
-// needs real layout) but never visible. `visibility:hidden` is not enough — it
-// still occupied its spot on line 0 — and `display:none` would zero the bounds.
-const PROBE_STYLE: &str = "position:absolute; top:0; left:-9999px; \
-    white-space:pre; pointer-events:none;";
-
-fn gutter_style() -> String {
-    format!(
-        "flex:0 0 {GUTTER_WIDTH}px; position:relative; overflow:hidden; \
-         user-select:none; background:#1e1e1e;"
-    )
+fn gutter_rows(version: Signal<u64>, model: &Rc<RefCell<EditorModel>>) -> Vec<render::GutterRow> {
+    version.get();
+    render::compute_gutter(&model.borrow())
 }
 
-fn number_style(top: f32) -> String {
-    format!(
-        "position:absolute; right:12px; top:{top}px; height:{LINE_HEIGHT}px; \
-         color:#6e7681; text-align:right;"
-    )
+fn selection_rects(
+    version: Signal<u64>,
+    model: &Rc<RefCell<EditorModel>>,
+    grid: Grid,
+) -> Vec<render::SelRect> {
+    version.get();
+    render::compute_sel_rects(&model.borrow(), &grid)
 }
 
-fn layers_style(content_height: f32) -> String {
-    format!("position:relative; height:{content_height}px;")
-}
-
-fn line_style(top: f32) -> String {
-    format!(
-        "position:absolute; z-index:2; left:{TEXT_PAD_LEFT}px; top:{top}px; \
-         height:{LINE_HEIGHT}px; white-space:pre;"
-    )
-}
-
-fn current_line_style(line: usize) -> String {
-    format!(
-        "position:absolute; z-index:0; left:0; right:0; top:{}px; \
-         height:{LINE_HEIGHT}px; background:#2a2d2e;",
-        line as f32 * LINE_HEIGHT
-    )
-}
-
-fn sel_rect_style(rect: SelRect, cw: f32) -> String {
-    format!(
-        "position:absolute; z-index:1; top:{}px; left:{}px; width:{}px; \
-         height:{LINE_HEIGHT}px; background:#264f78;",
-        rect.line as f32 * LINE_HEIGHT,
-        TEXT_PAD_LEFT + rect.start_vcol as f32 * cw,
-        (rect.end_vcol - rect.start_vcol) as f32 * cw,
-    )
-}
-
-fn caret_style(line: usize, vcol: usize, cw: f32) -> String {
-    format!(
-        "position:absolute; z-index:3; width:{CARET_WIDTH}px; height:{LINE_HEIGHT}px; \
-         top:{}px; left:{}px; background:#aeafad;",
-        line as f32 * LINE_HEIGHT,
-        TEXT_PAD_LEFT + vcol as f32 * cw,
-    )
+fn text_rows(
+    version: Signal<u64>,
+    model: &Rc<RefCell<EditorModel>>,
+    default_color: &str,
+) -> Vec<render::LineRender> {
+    version.get();
+    render::compute_lines(&mut model.borrow_mut(), default_color)
 }
