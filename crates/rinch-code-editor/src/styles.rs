@@ -49,6 +49,25 @@ pub(crate) fn gutter_style() -> String {
     )
 }
 
+/// The gutter's inner band, translated up by the scroll offset so its numbers —
+/// laid out in document coordinates — track the text's native scroll. The text
+/// scrolls itself (its container has `overflow:auto`); the gutter, which sits
+/// outside that container, is moved here instead.
+///
+/// The explicit `height` (the full document height, like the layer stack's) is
+/// load-bearing, not cosmetic: with only absolutely-positioned children the
+/// band's auto height is 0, and rinch's painter routes zero-height elements
+/// through a fast path that recurses into children *without composing the
+/// element's own transform* (rinch paint/mod.rs, the zero-dimension branch) —
+/// silently dropping the `translateY` and freezing the numbers in place.
+pub(crate) fn gutter_scroll_style(scroll_top: f64, content_h: f32) -> String {
+    format!(
+        "position:absolute; top:0; left:0; right:0; height:{content_h}px; \
+         transform:translateY({}px);",
+        -scroll_top
+    )
+}
+
 pub(crate) fn number_style(top: f32) -> String {
     format!(
         "position:absolute; right:12px; top:{top}px; height:{LINE_HEIGHT}px; \

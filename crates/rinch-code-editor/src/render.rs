@@ -8,9 +8,15 @@
 //! screen. Nothing here caches; the caching that matters (the highlighter's parse
 //! tree) lives below, in the model.
 //!
-//! There is no virtualization yet — these walk every line. Increment 4d replaces
-//! the whole-document walks with viewport slices; the return shapes stay put so
-//! that change does not reach the component.
+//! Everything is virtualized: the row-producing functions take the visible line
+//! `Range` the component computes from the scroll position and only materialize
+//! those lines. Row `top`s stay in *document* coordinates (`line * LINE_HEIGHT`),
+//! so a row keyed by its line number sits at the same place whether or not it was
+//! on screen last frame — native scroll (for the text) and a `translateY` (for the
+//! gutter) do the rest. The caret and current-line band are single elements the
+//! component renders unconditionally, so they are not sliced here.
+
+use std::ops::Range;
 
 use rinch_code_editor_model::{EditorModel, Grid, Theme, TokenMetadata};
 
@@ -50,13 +56,18 @@ pub(crate) struct SelRect {
     pub end_vcol: usize,
 }
 
-/// Turn the model into per-line render data: each line's char text is sliced by
-/// its token spans and each span coloured from the theme palette. Takes `&mut`
-/// because asking the highlighter for a line's tokens may parse and cache.
-pub(crate) fn compute_lines(model: &mut EditorModel, default_color: &str) -> Vec<LineRender> {
-    let line_count = model.len_lines();
-    let mut out = Vec::with_capacity(line_count);
-    for i in 0..line_count {
+/// Turn the visible lines into per-line render data: each line's char text is
+/// sliced by its token spans and each span coloured from the theme palette. Takes
+/// `&mut` because asking the highlighter for a line's tokens may parse and cache.
+/// Only `range` (already clamped to the document by the caller) is materialized.
+pub(crate) fn compute_lines(
+    model: &mut EditorModel,
+    range: Range<usize>,
+    default_color: &str,
+) -> Vec<LineRender> {
+    let end = range.end.min(model.len_lines());
+    let mut out = Vec::with_capacity(end.saturating_sub(range.start));
+    for i in range.start..end {
         let chars: Vec<char> = model.buffer().line_text(i).chars().collect();
         let tokens = model.line_tokens(i);
         let theme = model.theme();
@@ -83,9 +94,11 @@ pub(crate) fn compute_lines(model: &mut EditorModel, default_color: &str) -> Vec
     out
 }
 
-/// The gutter rows — one per document line.
-pub(crate) fn compute_gutter(model: &EditorModel) -> Vec<GutterRow> {
-    (0..model.len_lines())
+/// The gutter rows for the visible `range`. Tops are document coordinates; the
+/// component's `translateY` slides them to match the text's native scroll.
+pub(crate) fn compute_gutter(range: Range<usize>, line_count: usize) -> Vec<GutterRow> {
+    let end = range.end.min(line_count);
+    (range.start..end)
         .map(|i| GutterRow {
             number: i + 1,
             top: i as f32 * LINE_HEIGHT,
@@ -93,10 +106,16 @@ pub(crate) fn compute_gutter(model: &EditorModel) -> Vec<GutterRow> {
         .collect()
 }
 
-/// The selection rectangles for every non-empty selection, in grid coordinates.
-/// A line whose terminator is inside the selection shows a one-cell sliver past
-/// its content, so a selected line break reads as selected.
-pub(crate) fn compute_sel_rects(model: &EditorModel, grid: &Grid) -> Vec<SelRect> {
+/// The selection rectangles for every non-empty selection, clipped to the visible
+/// `range`, in grid coordinates. Clipping matters: a select-all on a large file
+/// would otherwise emit a rectangle per line. A line whose terminator is inside
+/// the selection shows a one-cell sliver past its content, so a selected line
+/// break reads as selected.
+pub(crate) fn compute_sel_rects(
+    model: &EditorModel,
+    grid: &Grid,
+    range: Range<usize>,
+) -> Vec<SelRect> {
     let buffer = model.buffer();
     let mut rects = Vec::new();
     let mut key = 0;
@@ -106,7 +125,9 @@ pub(crate) fn compute_sel_rects(model: &EditorModel, grid: &Grid) -> Vec<SelRect
         }
         let start = buffer.position_of(sel.start());
         let end = buffer.position_of(sel.end());
-        for line in start.line..=end.line {
+        let first = start.line.max(range.start);
+        let last = end.line.min(range.end.saturating_sub(1));
+        for line in first..=last {
             let line_text = buffer.line_text(line);
             let content_len = buffer.line_len(line);
             let s_col = if line == start.line { start.col } else { 0 };

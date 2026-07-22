@@ -23,11 +23,20 @@ const PAGE_LINES: usize = 20;
 
 /// Install the global keyboard interceptor. It drives `model`, bumps `version`
 /// so the reactive render repaints, and does nothing unless `focused` is set.
+///
+/// `after_op` runs after each consumed, state-changing key, once the render
+/// effects have flushed — the component uses it to reveal the caret and clamp
+/// the scroll. It is a plain callback, not an effect, on purpose: it writes the
+/// scroll signal, and a rinch signal write flushes subscribers synchronously, so
+/// doing it from inside an effect re-enters the running effect and panics
+/// ("RefCell already borrowed"). The interceptor path is the one context already
+/// verified safe for writes that flush (it is where `version.update` runs).
 pub(crate) fn install(
     model: Rc<RefCell<EditorModel>>,
     grid: Grid,
     version: Signal<u64>,
     focused: Signal<bool>,
+    after_op: impl Fn() + 'static,
 ) {
     set_keyboard_interceptor(move |ev| {
         if !focused.get() {
@@ -45,6 +54,7 @@ pub(crate) fn install(
             Some(changed) => {
                 if changed {
                     version.update(|v| *v = v.wrapping_add(1));
+                    after_op();
                 }
                 true
             }
@@ -123,6 +133,9 @@ fn apply(m: &mut EditorModel, grid: &Grid, ev: &KeyEventData) -> Option<bool> {
         "Delete" => Some(m.delete_forward().is_some()),
         "Enter" => Some(m.insert("\n").is_some()),
         "Tab" => Some(m.insert("\t").is_some()),
+        // rinch's desktop dispatch names the spacebar "Space" (the web backend
+        // delivers " "); without this arm every physical space is dropped.
+        "Space" => Some(m.insert(" ").is_some()),
         key => {
             if is_printable(key) && !ev.ctrl && !ev.alt && !ev.meta {
                 Some(m.insert(key).is_some())
