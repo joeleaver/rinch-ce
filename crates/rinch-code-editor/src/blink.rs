@@ -29,7 +29,7 @@
 //! *unfocused* stays stale until the next interaction — the caret is hidden
 //! then and the first click reconciles, so nothing visibly wrong survives.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rinch::core::{NodeHandle, Signal, TimeoutHandle, clear_timeout, set_timeout};
@@ -48,6 +48,12 @@ pub(crate) struct Blinker {
     scroll_top: Signal<f64>,
     view: NodeHandle,
     handle: RefCell<Option<TimeoutHandle>>,
+    /// The viewport height last seen by the reconciler, to catch resizes.
+    last_viewport: Cell<f64>,
+    /// Set when the component unmounts: the timer chain must not re-arm — a
+    /// parked callback holds this `Rc` and the view handle, so a chain that
+    /// kept re-arming would tick a ghost editor forever.
+    dead: Cell<bool>,
 }
 
 impl Blinker {
@@ -62,6 +68,8 @@ impl Blinker {
             scroll_top,
             view,
             handle: RefCell::new(None),
+            last_viewport: Cell::new(0.0),
+            dead: Cell::new(false),
         })
     }
 
@@ -69,6 +77,9 @@ impl Blinker {
     /// and start a fresh half-period. Called on focus and after every
     /// operation, which is exactly what keeps the caret solid under activity.
     pub(crate) fn restart(self: &Rc<Self>) {
+        if self.dead.get() {
+            return;
+        }
         if let Some(h) = self.handle.borrow_mut().take() {
             clear_timeout(h);
         }
@@ -86,8 +97,19 @@ impl Blinker {
         *self.handle.borrow_mut() = Some(h);
     }
 
+    /// Stop for good — the component's scope-cleanup hook. Idempotent.
+    pub(crate) fn stop(&self) {
+        self.dead.set(true);
+        if let Some(h) = self.handle.borrow_mut().take() {
+            clear_timeout(h);
+        }
+    }
+
     fn tick(self: &Rc<Self>) {
         self.handle.borrow_mut().take();
+        if self.dead.get() {
+            return;
+        }
         // Focus lost since arming: go quiet. The focus click restarts us.
         if !self.focused.get() {
             return;
@@ -98,10 +120,17 @@ impl Blinker {
     }
 
     /// Re-align the `scroll_top` signal with the DOM's actual offset — see
-    /// the module docs for why layout can move the latter silently.
+    /// the module docs for why layout can move the latter silently. A changed
+    /// viewport height triggers the write even when the offset is equal: the
+    /// visible-line window measures the viewport synchronously when this
+    /// signal notifies, so this is what rematerializes rows after the window
+    /// grows (nothing else re-runs on a pure resize).
     fn reconcile_scroll(&self) {
         let dom = self.view.scroll_top();
-        if self.scroll_top.get() != dom {
+        let viewport = self.view.client_height();
+        let resized = viewport != self.last_viewport.get();
+        self.last_viewport.set(viewport);
+        if self.scroll_top.get() != dom || resized {
             self.scroll_top.set(dom);
         }
     }

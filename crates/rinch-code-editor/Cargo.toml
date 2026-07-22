@@ -20,6 +20,10 @@ rinch = { workspace = true, features = ["clipboard"] }
 
 rinch-code-editor-model.workspace = true
 
+# Portable clock for the multi-click counter — std::time::Instant panics on
+# wasm32-unknown-unknown; this is the same crate rinch itself uses.
+web-time = "1"
+
 # Language support is forwarded, feature-for-feature, to the model crate (which
 # forwards to the syntax crate). Turning on `lang-rust` here compiles the Rust
 # grammar in and makes `language: "rust"` highlight; a build with none of these

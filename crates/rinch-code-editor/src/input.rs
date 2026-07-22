@@ -1,4 +1,4 @@
-//! Input: turning key and mouse events into model operations.
+//! Keyboard input: turning key events into model operations.
 //!
 //! rinch routes keys through a single global interceptor rather than per-element
 //! `onkeydown`, so [`install`] registers one closure that owns a handle to the
@@ -12,33 +12,23 @@
 //! printable character types. Everything the editor does not claim returns
 //! `false` so the runtime still sees it.
 //!
-//! The mouse side is [`text_mousedown`]: the `onmousedown` handler for the layer
-//! stack that places the caret at the click (Shift extends), Monaco's midpoint
-//! snapping included via the grid's hit-testing.
+//! The mouse side lives in [`mod@crate::mouse`]; the [`InputCtx`] bundle both
+//! surfaces share is defined here.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rinch::core::{
-    Drag, KeyEventData, Memo, MouseButton, NodeHandle, Signal, get_click_context,
-    set_keyboard_interceptor,
-};
-use rinch_code_editor_model::{EditorModel, Grid, Motion, Position, Selection, Selections};
+use rinch::core::{KeyEventData, Memo, NodeHandle, Signal, set_keyboard_interceptor};
+use rinch_code_editor_model::{EditorModel, Grid, Motion, Selection, Selections};
 
 use crate::clipboard;
-use crate::styles::{LINE_HEIGHT, TEXT_PAD_LEFT};
+use crate::mouse::{ClickCounter, GestureStart};
+use crate::styles::LINE_HEIGHT;
 
 /// Page Up/Down step when the viewport has not been laid out yet (its measured
 /// height is 0 on the first frame); afterwards the step is the real count of
 /// fully visible lines.
 const FALLBACK_PAGE_LINES: usize = 20;
-
-/// Width of the interactive strip rinch reserves at the right edge of a scroll
-/// container whose content overflows (see rinch's `find_scrollbar_hit`): a press
-/// there grabs the scrollbar, and since rinch dispatches `data-onmousedown`
-/// additively *before* the scrollbar logic, the caret handler has to step aside
-/// itself — Monaco likewise never moves the cursor on a scrollbar grab.
-const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
 
 /// The live wiring both input surfaces (keyboard interceptor, mouse handler)
 /// drive: the document, its render signals, the measured geometry, and the
@@ -63,6 +53,14 @@ pub(crate) struct InputCtx {
     pub scroll_top: Signal<f64>,
     pub view: NodeHandle,
     pub after_op: Rc<dyn Fn()>,
+    /// Runs when a press takes focus, before anything else — arms the caret
+    /// blink even on presses that then claim nothing (a right-click).
+    pub on_focus: Rc<dyn Fn()>,
+    /// The multi-click state the mouse handler counts presses through.
+    pub clicks: Rc<RefCell<ClickCounter>>,
+    /// Monaco's `selectionStart`: the last gesture's range, persisted across
+    /// presses so Shift+click extends around the clicked word or line.
+    pub gesture: Rc<RefCell<Option<GestureStart>>>,
 }
 
 /// Install the global keyboard interceptor. It drives the model, bumps the
@@ -101,118 +99,6 @@ pub(crate) fn install(ctx: InputCtx) {
             }
         }
     });
-}
-
-/// The char offset under a document-space point: the line under `y` (clamped
-/// into the document), then the nearest character boundary to `x` on it —
-/// Monaco's midpoint rule, via the grid. `x` is pixels from the glyph origin;
-/// `cell_w` is the measured cell advance. `line_text` carries no terminator, so
-/// a point past the end of a line lands at the line end for free.
-fn hit_offset(m: &EditorModel, grid: &Grid, cell_w: f32, x: f32, y: f32) -> usize {
-    let line = grid.line_at_y(y, m.len_lines());
-    let text = m.buffer().line_text(line);
-    let col = grid.char_column_at_visual(&text, x / cell_w);
-    m.buffer().offset_of(Position::new(line, col))
-}
-
-/// Build the `onmousedown` handler for the layer stack: place the caret at the
-/// pressed position (Shift extends the primary selection there instead), then
-/// capture the pointer for drag selection until mouseup. Also takes focus, so a
-/// press anywhere in the text starts routing keys here.
-///
-/// The handler element is the document-sized layer stack, which scrolls with the
-/// text, and rinch's mouse dispatch subtracts ancestor scroll offsets when it
-/// computes the handler element's bounds — so the element-relative press
-/// position *is* the document position, with no scroll arithmetic at all.
-///
-/// The drag goes through rinch's `Drag` pointer capture: `on_move` keeps firing
-/// with viewport coordinates wherever the pointer goes (over the gutter, off the
-/// editor) until mouseup lands anywhere, so there are no dead zones and no stuck
-/// drags. Two coordinate subtleties in the capture:
-///
-/// - The layer stack's bounds go stale the moment the drag scrolls (it moves
-///   with the text), so the drag captures the *scroll container's* viewport
-///   origin instead — `element_y + scroll_top` — which holds still while the
-///   document slides under it; each move then adds the live `scroll_top` back.
-/// - Extending to a line outside the viewport reveals it (`after_op`), which
-///   scrolls the view — so dragging at the edge advances line by line as the
-///   pointer moves. Continuous timer-driven auto-scroll while the pointer rests
-///   past the edge is Monaco behavior deferred to the polish increment.
-pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
-    move || {
-        ctx.focused.set(true);
-        let click = get_click_context();
-        if click.button != MouseButton::Left {
-            return;
-        }
-        // Step aside for a scrollbar grab (the strip only exists when the
-        // document overflows the viewport; the layer stack's height is the
-        // document's).
-        let viewport = ctx.view.client_height() as f32;
-        if viewport > 0.0
-            && click.element_height > viewport
-            && click.mouse_x >= click.element_x + click.element_width - SCROLLBAR_HIT_WIDTH
-        {
-            return;
-        }
-        // Confine the borrow, as in the interceptor: the version bump below
-        // flushes render effects that borrow the model.
-        {
-            let mut m = ctx.model.borrow_mut();
-            let offset = hit_offset(
-                &m,
-                &ctx.grid,
-                ctx.cell_w.get(),
-                click.mouse_x - click.element_x - TEXT_PAD_LEFT,
-                click.mouse_y - click.element_y,
-            );
-            if click.modifiers.shift {
-                let anchor = m.selections().primary().anchor;
-                m.set_selections(Selections::single(Selection::new(anchor, offset)));
-            } else {
-                m.set_cursor(offset);
-            }
-        }
-        // Repaint unconditionally: even a press on the caret's own cell can
-        // collapse a selection or a multi-cursor set, and a redundant repaint of
-        // an unchanged frame is cheap next to detecting one.
-        ctx.version.update(|v| *v = v.wrapping_add(1));
-        (ctx.after_op)();
-
-        // Capture the pointer for the selection drag. The anchor is re-read from
-        // the model on every move (not captured here) so the drag keeps working
-        // off the live primary selection — this is also what makes Shift+press
-        // followed by a drag extend from the original anchor, as Monaco does.
-        let origin_x = click.element_x + TEXT_PAD_LEFT;
-        let view_top = click.element_y + ctx.scroll_top.get() as f32;
-        let drag = ctx.clone();
-        Drag::absolute()
-            .on_move(move |mx, my| {
-                let changed = {
-                    let mut m = drag.model.borrow_mut();
-                    let doc_y = my - view_top + drag.scroll_top.get() as f32;
-                    let offset =
-                        hit_offset(&m, &drag.grid, drag.cell_w.get(), mx - origin_x, doc_y);
-                    let primary = *m.selections().primary();
-                    // Moves within the same cell change nothing — skip the
-                    // repaint; mousemove arrives per pixel, cells are ~8px.
-                    if offset == primary.head {
-                        false
-                    } else {
-                        m.set_selections(Selections::single(Selection::new(
-                            primary.anchor,
-                            offset,
-                        )));
-                        true
-                    }
-                };
-                if changed {
-                    drag.version.update(|v| *v = v.wrapping_add(1));
-                    (drag.after_op)();
-                }
-            })
-            .start();
-    }
 }
 
 /// Map one key event to a model operation. `None` means the editor does not
@@ -320,7 +206,8 @@ fn moved(m: &mut EditorModel, grid: &Grid, motion: Motion, extend: bool) -> Opti
 }
 
 /// Collapse to one selection spanning the whole document, caret at the end.
-fn select_all(m: &mut EditorModel) {
+/// Shared with the mouse side: four clicks select all, as Ctrl+A does.
+pub(crate) fn select_all(m: &mut EditorModel) {
     let end = m.len_chars();
     m.set_selections(Selections::single(Selection::new(0, end)));
 }

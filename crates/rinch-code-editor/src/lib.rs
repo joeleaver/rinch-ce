@@ -47,6 +47,7 @@ mod blink;
 mod clipboard;
 mod highlight;
 mod input;
+mod mouse;
 mod render;
 mod styles;
 
@@ -166,8 +167,14 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     // The caret blinker: solid through activity, pulsing when idle, hidden
     // unfocused — its tick also reconciles the silent resize clamp. Restarted
     // by `after_op` below and by the focus handlers, i.e. on exactly the
-    // cursor-state changes Monaco restarts on.
+    // cursor-state changes Monaco restarts on. Stopped on unmount: the timer
+    // chain re-arms itself and a parked callback owns the blinker, so without
+    // the cleanup it would tick a ghost editor forever.
     let blinker = blink::Blinker::new(focused, scroll_top, view.clone());
+    __scope.on_cleanup({
+        let blinker = blinker.clone();
+        move || blinker.stop()
+    });
 
     // Everything that runs after a state-changing operation, from the safe
     // input-handler context: reveal the caret and clamp the scroll, then give
@@ -278,9 +285,15 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
         scroll_top,
         view: view.clone(),
         after_op,
+        on_focus: Rc::new({
+            let blinker = blinker.clone();
+            move || blinker.restart()
+        }),
+        clicks: Rc::new(RefCell::new(mouse::ClickCounter::new())),
+        gesture: Rc::new(RefCell::new(None)),
     };
     input::install(input_ctx.clone());
-    let on_text_mousedown = input::text_mousedown(input_ctx);
+    let on_text_mousedown = mouse::text_mousedown(input_ctx);
 
     // The caret's style closure reads these two `Copy` signals — never the
     // `Rc<Blinker>` itself, which a reactive style block must not capture.

@@ -164,22 +164,31 @@ fn line_end(buffer: &Buffer, head: usize) -> usize {
 // ---- word motion ---------------------------------------------------------
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Class {
+pub(crate) enum Class {
     Word,
     Space,
     Other,
 }
 
-/// Monaco-style classification: identifier characters (alphanumeric and `_`) are
-/// one class so `snake_case` is a single word, whitespace another, and every
-/// other symbol a third so a run of punctuation is skipped as a unit.
-fn class(c: char) -> Class {
-    if c.is_alphanumeric() || c == '_' {
-        Class::Word
-    } else if c.is_whitespace() {
+/// Monaco's default `wordSeparators` (`USUAL_WORD_SEPARATORS` in
+/// wordHelper.ts): the ASCII punctuation that splits words.
+const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+/// Monaco's classification, exactly its `WordCharacterClassifier` with the
+/// default separators: whitespace is one class, the separator punctuation
+/// another (a run like `===` is skipped as a unit), and *everything else* is
+/// word material — identifiers, CJK, emoji, combining marks. Classifying only
+/// the known separators (rather than only alphanumerics as word) is what
+/// keeps a decomposed `é` or a 👍 inside the word around it. Shared with the
+/// mouse gestures ([`crate::select`]), so a double-clicked word and a
+/// Ctrl+Arrow word are always the same word.
+pub(crate) fn class(c: char) -> Class {
+    if c.is_whitespace() {
         Class::Space
-    } else {
+    } else if WORD_SEPARATORS.contains(c) {
         Class::Other
+    } else {
+        Class::Word
     }
 }
 
