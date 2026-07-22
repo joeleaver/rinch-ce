@@ -13,7 +13,10 @@ description = "A Monaco-parity code editor component for the rinch GUI framework
 # rinch's desktop build needs. See README.md ("rinch is a peer dependency").
 # The facade re-exports `rinch::core` (= rinch-core) and the `rsx!`/`component`
 # macros unconditionally, so `rsx!` resolves with no shim and no backend feature.
-rinch = { workspace = true }
+# `clipboard` is the one facade feature the editor turns on itself: Ctrl+X/C/V
+# are core editing, and rinch-clipboard is backend-neutral (arboard on desktop,
+# an in-page buffer on wasm) so it drags no renderer in.
+rinch = { workspace = true, features = ["clipboard"] }
 
 rinch-code-editor-model.workspace = true
 

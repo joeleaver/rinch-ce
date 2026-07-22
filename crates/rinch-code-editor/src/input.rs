@@ -7,8 +7,9 @@
 //! otherwise fall through to the runtime untouched.
 //!
 //! The mapping in [`apply`] is intentionally small and Monaco-shaped: arrows and
-//! their Ctrl/Shift variants move or extend, the edit keys insert and delete, and
-//! a bare printable character types. Everything the editor does not claim returns
+//! their Ctrl/Shift variants move or extend, the edit keys insert and delete,
+//! Ctrl+X/C/V drive the clipboard (see [`mod@crate::clipboard`]), and a bare
+//! printable character types. Everything the editor does not claim returns
 //! `false` so the runtime still sees it.
 //!
 //! The mouse side is [`text_mousedown`]: the `onmousedown` handler for the layer
@@ -24,6 +25,7 @@ use rinch::core::{
 };
 use rinch_code_editor_model::{EditorModel, Grid, Motion, Position, Selection, Selections};
 
+use crate::clipboard;
 use crate::styles::{LINE_HEIGHT, TEXT_PAD_LEFT};
 
 /// Page Up/Down step when the viewport has not been laid out yet (its measured
@@ -220,7 +222,9 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
 /// nothing, so it does not trigger a repaint.
 fn apply(m: &mut EditorModel, grid: &Grid, ev: &KeyEventData, page_lines: usize) -> Option<bool> {
     // Ctrl combos first. On desktop `meta` is always false — Cmd arrives as ctrl
-    // — so ctrl is the one modifier that carries shortcuts.
+    // — so ctrl is the one modifier that carries shortcuts. Key strings arrive
+    // lowercase from the desktop backend but verbatim (case follows Shift) from
+    // the web one, hence the double patterns.
     if ev.ctrl && !ev.alt {
         match ev.key.as_str() {
             "z" | "Z" if ev.shift => return Some(m.redo().is_some()),
@@ -230,6 +234,16 @@ fn apply(m: &mut EditorModel, grid: &Grid, ev: &KeyEventData, page_lines: usize)
                 select_all(m);
                 return Some(true);
             }
+            // Clipboard. Copy is consumed but changes nothing on screen.
+            // Ctrl+Shift+C/X stay unclaimed (Monaco leaves them too — the
+            // browser wants them); Ctrl+Shift+V is paste-as-plain-text, which
+            // in an unformatted editor is just paste.
+            "c" | "C" if !ev.shift => {
+                clipboard::copy(m);
+                return Some(false);
+            }
+            "x" | "X" if !ev.shift => return Some(clipboard::cut(m).is_some()),
+            "v" | "V" => return Some(clipboard::paste(m).is_some()),
             _ => {}
         }
     }

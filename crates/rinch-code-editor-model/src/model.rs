@@ -304,17 +304,39 @@ impl EditorModel {
             return None;
         }
 
-        let lines_before = self.buffer.len_lines();
-        let change = Change::apply(&mut self.buffer, edits);
         let after = Selections::new(
             new_carets.into_iter().map(Selection::cursor).collect(),
             primary,
         );
+        Some(self.commit(kind, coalesce, edits, after))
+    }
+
+    /// The commit tail every text-changing operation shares: apply the edits as
+    /// one atomic change, install the post-change selections, record history,
+    /// resync the highlighter, and summarize — the four steps that must happen
+    /// together, in this order (see the crate docs). Callers hand in `after` in
+    /// *post-change* coordinates because only they know where their carets land:
+    /// the cursor-edit pipeline above collapses to the end of each insertion,
+    /// while the clipboard operations (cut's line-wise deletes, paste-above's
+    /// preserved caret) place carets the running-delta rule cannot express.
+    ///
+    /// Resets coalescing to `None`; an operation that extends a run (`insert`,
+    /// `backspace`) sets its kind again afterwards.
+    pub(crate) fn commit(
+        &mut self,
+        kind: EditKind,
+        coalesce: bool,
+        edits: Vec<Edit>,
+        after: Selections,
+    ) -> EditSummary {
+        let before = self.selections.clone();
+        let lines_before = self.buffer.len_lines();
+        let change = Change::apply(&mut self.buffer, edits);
         self.selections = after.clone();
         self.history.push(change.clone(), before, after, coalesce);
         self.highlighter.apply_change(&self.buffer, &change);
-
-        Some(self.summarize(&change, kind, lines_before))
+        self.coalesce = CoalesceKind::None;
+        self.summarize(&change, kind, lines_before)
     }
 
     fn summarize(&mut self, change: &Change, kind: EditKind, lines_before: usize) -> EditSummary {

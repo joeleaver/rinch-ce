@@ -7,9 +7,9 @@
 //!
 //! [`EditorModel`] owns a [`Buffer`], its [`Selections`], an undo [`History`],
 //! and a [`Highlighter`], and exposes a small set of *semantic* edit operations
-//! — `insert`, `backspace`, `delete_forward`, `undo`, `redo`. Each one does the
-//! four things that must always happen together, in the one order that keeps
-//! them consistent:
+//! — `insert`, `backspace`, `delete_forward`, `cut`, `paste`, `undo`, `redo`.
+//! Each one does the four things that must always happen together, in the one
+//! order that keeps them consistent:
 //!
 //! 1. derive the low-level [`Edit`]s from the current selections,
 //! 2. apply them to the buffer as one atomic [`Change`],
@@ -37,11 +37,13 @@
 //! consequence of an edit; asking it to move the caret one column left is the
 //! view layer's job, because that needs the visual line model the view builds.
 
+mod clipboard;
 mod cursor;
 mod geometry;
 mod graphemes;
 mod model;
 
+pub use clipboard::ClipboardPayload;
 pub use cursor::Motion;
 pub use geometry::Grid;
 pub use model::{EditKind, EditSummary, EditorModel};

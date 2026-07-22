@@ -5,7 +5,7 @@
 //! in the three rinch-free crates below this one; here we only turn the
 //! [`EditorModel`] into DOM and drive it from the keyboard.
 //!
-//! # Status: Increment 4d — scrolling and virtualization
+//! # Status: Increment 5 — polish (clipboard landed)
 //!
 //! The editor scrolls, and only materializes what is on screen. On top of the
 //! live editing of 4c:
@@ -34,10 +34,16 @@
 //!   character boundary (Monaco's midpoint rule); Shift+press extends the
 //!   primary selection; dragging extends it continuously under pointer capture,
 //!   revealing as it crosses the viewport edge. See [`mod@input`].
+//! - **Clipboard.** Ctrl+X/C/V with Monaco's semantics — empty-selection copy
+//!   and cut take the whole line, pasting a whole-line copy inserts it above
+//!   the caret's line, multi-cursor copies distribute back piece-per-cursor —
+//!   through `rinch::clipboard` plus Monaco's in-memory metadata store. See
+//!   [`mod@clipboard`] (and its web caveat).
 //!
-//! Still to come: the polish increment (caret blink, word/line select on
-//! double/triple press, timer-driven drag auto-scroll, the resize clamp gap).
+//! Still to come, in the rest of this increment: caret blink, word/line select
+//! on double/triple press, timer-driven drag auto-scroll, the resize clamp gap.
 
+mod clipboard;
 mod highlight;
 mod input;
 mod render;
