@@ -43,6 +43,7 @@
 //! Still to come, in the rest of this increment: caret blink, word/line select
 //! on double/triple press, timer-driven drag auto-scroll, the resize clamp gap.
 
+mod blink;
 mod clipboard;
 mod highlight;
 mod input;
@@ -127,11 +128,9 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     // its subscribers synchronously, and a flush from inside a running effect
     // re-enters it — "RefCell already borrowed". Interceptor and mouse-handler
     // context is verified safe for flushing writes (it is where `version.update`
-    // already runs); a window resize can still clamp silently, a known gap shared
-    // with the synchronous viewport measurement below, left for the polish
-    // increment. `Rc` because both the keyboard interceptor and the mousedown
-    // handler run it after their ops.
-    let reveal_and_clamp: Rc<dyn Fn()> = Rc::new({
+    // already runs). A window resize can still clamp silently — rinch fires no
+    // resize event — which the blink tick's reconciler covers; see [`mod@blink`].
+    let reveal_and_clamp = {
         let vh = view.clone();
         let m = model.clone();
         move || {
@@ -161,6 +160,23 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
                 vh.set_scroll_top(new_st as f64);
                 scroll_top.set(new_st as f64);
             }
+        }
+    };
+
+    // The caret blinker: solid through activity, pulsing when idle, hidden
+    // unfocused — its tick also reconciles the silent resize clamp. Restarted
+    // by `after_op` below and by the focus handlers, i.e. on exactly the
+    // cursor-state changes Monaco restarts on.
+    let blinker = blink::Blinker::new(focused, scroll_top, view.clone());
+
+    // Everything that runs after a state-changing operation, from the safe
+    // input-handler context: reveal the caret and clamp the scroll, then give
+    // the caret a fresh solid half-period.
+    let after_op: Rc<dyn Fn()> = Rc::new({
+        let blinker = blinker.clone();
+        move || {
+            reveal_and_clamp();
+            blinker.restart();
         }
     });
 
@@ -261,10 +277,14 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
         cell_w,
         scroll_top,
         view: view.clone(),
-        after_op: reveal_and_clamp,
+        after_op,
     };
     input::install(input_ctx.clone());
     let on_text_mousedown = input::text_mousedown(input_ctx);
+
+    // The caret's style closure reads these two `Copy` signals — never the
+    // `Rc<Blinker>` itself, which a reactive style block must not capture.
+    let blink_visible = blinker.visible;
 
     // The layer stack, sized to the whole document (the scroll spacer). Children
     // are z-ordered: current-line band, selection, text, caret. Only the visible
@@ -307,12 +327,16 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
                 }
             }
 
-            // Caret (z 3) — in front of the text.
+            // Caret (z 3) — in front of the text. Shown only while the editor
+            // is focused and the blink is in its visible half; toggling
+            // `display` at an unchanged position keeps rinch's dirty-region
+            // fast path (a caret *move* is what forces the full repaint).
             div {
                 style: {
                     move || {
                         let (line, vcol) = caret.get();
-                        caret_style(line, vcol, cell_w.get())
+                        let shown = focused.get() && blink_visible.get();
+                        caret_style(line, vcol, cell_w.get(), shown)
                     }
                 },
             }
@@ -329,7 +353,14 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
             // Focus-only fallback: reached when a press misses the layer stack —
             // the gutter, or below a document shorter than the viewport. (The
             // layer-stack handler shadows this one over the text; see above.)
-            onmousedown: move || focused.set(true),
+            // Taking focus shows the caret, so the blink starts here too.
+            onmousedown: {
+                let blinker = blinker.clone();
+                move || {
+                    focused.set(true);
+                    blinker.restart();
+                }
+            },
 
             // Gutter: a clipped column whose inner band is translated to match the
             // text's native scroll, so its numbers slide in lockstep. Only the

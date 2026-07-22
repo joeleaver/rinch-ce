@@ -107,12 +107,14 @@ pub(crate) fn sel_rect_style(line: usize, start_vcol: usize, end_vcol: usize, cw
 }
 
 /// The caret bar, from its line and visual column. `cw` is the measured cell
-/// advance the horizontal position multiplies in.
-pub(crate) fn caret_style(line: usize, vcol: usize, cw: f32) -> String {
+/// advance the horizontal position multiplies in; `shown` is the blink/focus
+/// gate — hiding via `display` (not removal) keeps the node cheap to toggle.
+pub(crate) fn caret_style(line: usize, vcol: usize, cw: f32, shown: bool) -> String {
     format!(
         "position:absolute; z-index:3; width:{CARET_WIDTH}px; height:{LINE_HEIGHT}px; \
-         top:{}px; left:{}px; background:#aeafad;",
+         top:{}px; left:{}px; background:#aeafad;{}",
         line as f32 * LINE_HEIGHT,
         TEXT_PAD_LEFT + vcol as f32 * cw,
+        if shown { "" } else { " display:none;" },
     )
 }
