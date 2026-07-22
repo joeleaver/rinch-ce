@@ -41,14 +41,16 @@
 //! so a double-click drag stays word-wise wherever the pointer goes.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use rinch::core::{Drag, MouseButton, get_click_context};
 use rinch_code_editor_model::{
-    EditorModel, Grid, Position, Selections, extend_from, line_drag, line_range_at, word_drag,
-    word_range_at,
+    EditorModel, Grid, Position, Selection, Selections, extend_from, line_drag, line_range_at,
+    word_drag, word_range_at,
 };
 use web_time::Instant;
 
+use crate::autoscroll::AutoScroll;
 use crate::input::{InputCtx, select_all};
 use crate::styles::TEXT_PAD_LEFT;
 
@@ -127,22 +129,33 @@ impl ClickCounter {
 /// check that stands in for Monaco resetting its `selectionStart` on every
 /// non-mouse cursor operation.
 pub(crate) struct GestureStart {
-    range: Range<usize>,
-    primary: (usize, usize),
+    pub(crate) range: Range<usize>,
+    pub(crate) primary: (usize, usize),
 }
 
 /// What kind of selection this drag extends, fixed at the press, each
-/// carrying the gesture range it extends from.
-enum DragMode {
+/// carrying the gesture range it extends from. Shared with the auto-scroller,
+/// which keeps extending in the same mode while the pointer rests past the
+/// viewport edge.
+pub(crate) enum DragMode {
     Char(Range<usize>),
     Word(Range<usize>),
     Line(Range<usize>),
 }
 
 impl DragMode {
-    fn range(&self) -> &Range<usize> {
+    pub(crate) fn range(&self) -> &Range<usize> {
         match self {
             DragMode::Char(r) | DragMode::Word(r) | DragMode::Line(r) => r,
+        }
+    }
+
+    /// The selection this drag mode produces with its head at `offset`.
+    pub(crate) fn extend(&self, m: &EditorModel, offset: usize) -> Selection {
+        match self {
+            DragMode::Char(initial) => extend_from(initial, offset),
+            DragMode::Word(initial) => word_drag(m.buffer(), initial, offset),
+            DragMode::Line(initial) => line_drag(m.buffer(), initial, offset),
         }
     }
 }
@@ -152,7 +165,7 @@ impl DragMode {
 /// Monaco's midpoint rule, via the grid. `x` is pixels from the glyph origin;
 /// `cell_w` is the measured cell advance. `line_text` carries no terminator, so
 /// a point past the end of a line lands at the line end for free.
-fn hit_offset(m: &EditorModel, grid: &Grid, cell_w: f32, x: f32, y: f32) -> usize {
+pub(crate) fn hit_offset(m: &EditorModel, grid: &Grid, cell_w: f32, x: f32, y: f32) -> usize {
     let line = grid.line_at_y(y, m.len_lines());
     let text = m.buffer().line_text(line);
     let col = grid.char_column_at_visual(&text, x / cell_w);
@@ -175,17 +188,17 @@ fn hit_offset(m: &EditorModel, grid: &Grid, cell_w: f32, x: f32, y: f32) -> usiz
 ///   origin instead — `element_y + scroll_top` at press — which holds still
 ///   while the document slides under it; each move adds the live `scroll_top`
 ///   back.
-/// - Extending to a line outside the viewport reveals it (`after_op`), which
-///   scrolls the view — so dragging at the edge advances as the pointer
-///   moves. Timer-driven auto-scroll while the pointer rests past the edge is
-///   the next increment.
+/// - A move outside the viewport does not extend directly: it feeds the
+///   [`AutoScroll`] timer, which scrolls at Monaco's distance-based speed and
+///   extends to the edge line each tick until the pointer comes back in (or
+///   the drag ends).
 pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
     move || {
         // Take focus and arm the blink *before* the early returns below: a
         // right-click or a scrollbar grab focuses the editor too, and a
         // focused caret with no blink timer would sit solid forever.
         ctx.focused.set(true);
-        (ctx.on_focus)();
+        (ctx.blink_restart)();
         let click = get_click_context();
         if click.button != MouseButton::Left {
             return;
@@ -289,28 +302,43 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         // Capture the pointer for the selection drag. Every mode extends from
         // its gesture range — Monaco's per-move `_computeSelection` against
         // the stored selectionStart — so a drag after Shift+press keeps the
-        // original range inside the selection, whichever way it goes.
+        // original range inside the selection, whichever way it goes. A move
+        // past the viewport's top or bottom hands off to the auto-scroller
+        // instead of extending; re-entering hands back.
         let origin_x = click.element_x + TEXT_PAD_LEFT;
         let view_top = click.element_y + ctx.scroll_top.get() as f32;
+        let mode = Rc::new(mode);
+        let scroller = AutoScroll::new(ctx.clone(), mode.clone(), origin_x, view_top);
+        // Park the scroller where a later press and the unmount cleanup can
+        // reach it; stop any predecessor a lost `on_end` left behind.
+        if let Some(old) = ctx.scroller.borrow_mut().replace(scroller.clone()) {
+            old.stop();
+        }
         let drag = ctx.clone();
+        let end_scroller = scroller.clone();
+        let end_slot = ctx.scroller.clone();
         Drag::absolute()
             .on_move(move |mx, my| {
+                let viewport = drag.view.client_height() as f32;
+                if viewport > 0.0 && (my < view_top || my > view_top + viewport) {
+                    scroller.update_pointer(mx, my);
+                    return;
+                }
+                scroller.stop();
                 let changed = {
                     let mut m = drag.model.borrow_mut();
                     let doc_y = my - view_top + drag.scroll_top.get() as f32;
                     let offset =
                         hit_offset(&m, &drag.grid, drag.cell_w.get(), mx - origin_x, doc_y);
                     let primary = *m.selections().primary();
-                    let sel = match &mode {
-                        // Moves within the same cell change nothing — skip the
-                        // repaint; mousemove arrives per pixel, cells are ~8px.
-                        DragMode::Char(_) if offset == primary.head => None,
-                        DragMode::Char(initial) => Some(extend_from(initial, offset)),
-                        DragMode::Word(initial) => Some(word_drag(m.buffer(), initial, offset)),
-                        DragMode::Line(initial) => Some(line_drag(m.buffer(), initial, offset)),
-                    };
-                    match sel {
-                        Some(s) if s.anchor != primary.anchor || s.head != primary.head => {
+                    // Moves within the same cell change nothing on a char
+                    // drag — skip even computing; mousemove arrives per
+                    // pixel, cells are ~8px.
+                    if matches!(&*mode, DragMode::Char(_)) && offset == primary.head {
+                        false
+                    } else {
+                        let s = mode.extend(&m, offset);
+                        if s.anchor != primary.anchor || s.head != primary.head {
                             m.set_selections(Selections::single(s));
                             // Keep the stored gesture current through the
                             // drag, so a Shift+press right after keeps
@@ -320,14 +348,19 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                                 primary: (s.anchor, s.head),
                             });
                             true
+                        } else {
+                            false
                         }
-                        _ => false,
                     }
                 };
                 if changed {
                     drag.version.update(|v| *v = v.wrapping_add(1));
                     (drag.after_op)();
                 }
+            })
+            .on_end(move |_, _| {
+                end_scroller.stop();
+                end_slot.borrow_mut().take();
             })
             .start();
     }

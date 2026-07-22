@@ -21,6 +21,7 @@ use std::rc::Rc;
 use rinch::core::{KeyEventData, Memo, NodeHandle, Signal, set_keyboard_interceptor};
 use rinch_code_editor_model::{EditorModel, Grid, Motion, Selection, Selections};
 
+use crate::autoscroll::AutoScroll;
 use crate::clipboard;
 use crate::mouse::{ClickCounter, GestureStart};
 use crate::styles::LINE_HEIGHT;
@@ -53,14 +54,20 @@ pub(crate) struct InputCtx {
     pub scroll_top: Signal<f64>,
     pub view: NodeHandle,
     pub after_op: Rc<dyn Fn()>,
-    /// Runs when a press takes focus, before anything else — arms the caret
-    /// blink even on presses that then claim nothing (a right-click).
-    pub on_focus: Rc<dyn Fn()>,
+    /// Restart the caret blink alone — everything `after_op` does except the
+    /// caret reveal. For presses that take focus but claim nothing (a
+    /// right-click), and for the auto-scroll tick, whose scrolling a reveal
+    /// would fight (Monaco dispatches those with `RevealType::None`).
+    pub blink_restart: Rc<dyn Fn()>,
     /// The multi-click state the mouse handler counts presses through.
     pub clicks: Rc<RefCell<ClickCounter>>,
     /// Monaco's `selectionStart`: the last gesture's range, persisted across
     /// presses so Shift+click extends around the clicked word or line.
     pub gesture: Rc<RefCell<Option<GestureStart>>>,
+    /// The drag auto-scroller currently alive, if any — held so a new press
+    /// and the component's unmount cleanup can stop it; `on_end` alone cannot
+    /// be relied on (rinch's `Drag::cancel` drops it unfired).
+    pub scroller: Rc<RefCell<Option<Rc<AutoScroll>>>>,
 }
 
 /// Install the global keyboard interceptor. It drives the model, bumps the

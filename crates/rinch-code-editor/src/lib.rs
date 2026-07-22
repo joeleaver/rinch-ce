@@ -43,6 +43,7 @@
 //! Still to come, in the rest of this increment: caret blink, word/line select
 //! on double/triple press, timer-driven drag auto-scroll, the resize clamp gap.
 
+mod autoscroll;
 mod blink;
 mod clipboard;
 mod highlight;
@@ -285,13 +286,23 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
         scroll_top,
         view: view.clone(),
         after_op,
-        on_focus: Rc::new({
+        blink_restart: Rc::new({
             let blinker = blinker.clone();
             move || blinker.restart()
         }),
         clicks: Rc::new(RefCell::new(mouse::ClickCounter::new())),
         gesture: Rc::new(RefCell::new(None)),
+        scroller: Rc::new(RefCell::new(None)),
     };
+    // A drag's auto-scroll timer must not outlive the component either.
+    __scope.on_cleanup({
+        let slot = input_ctx.scroller.clone();
+        move || {
+            if let Some(s) = slot.borrow_mut().take() {
+                s.stop();
+            }
+        }
+    });
     input::install(input_ctx.clone());
     let on_text_mousedown = mouse::text_mousedown(input_ctx);
 
