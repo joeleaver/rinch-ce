@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use rinch::core::{
-    KeyEventData, Memo, MouseButton, NodeHandle, Signal, get_click_context,
+    Drag, KeyEventData, Memo, MouseButton, NodeHandle, Signal, get_click_context,
     set_keyboard_interceptor,
 };
 use rinch_code_editor_model::{EditorModel, Grid, Motion, Position, Selection, Selections};
@@ -38,32 +38,43 @@ const FALLBACK_PAGE_LINES: usize = 20;
 /// itself — Monaco likewise never moves the cursor on a scrollbar grab.
 const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
 
-/// Install the global keyboard interceptor. It drives `model`, bumps `version`
-/// so the reactive render repaints, and does nothing unless `focused` is set.
+/// The live wiring both input surfaces (keyboard interceptor, mouse handler)
+/// drive: the document, its render signals, the measured geometry, and the
+/// scroll container. One bundle because the two handlers are facets of the same
+/// input path and share almost all of it.
 ///
-/// `after_op` runs after each consumed, state-changing key, once the render
-/// effects have flushed — the component uses it to reveal the caret and clamp
-/// the scroll. It is a plain callback, not an effect, on purpose: it writes the
-/// scroll signal, and a rinch signal write flushes subscribers synchronously, so
-/// doing it from inside an effect re-enters the running effect and panics
-/// ("RefCell already borrowed"). The interceptor path is the one context already
-/// verified safe for writes that flush (it is where `version.update` runs).
-pub(crate) fn install(
-    model: Rc<RefCell<EditorModel>>,
-    grid: Grid,
-    version: Signal<u64>,
-    focused: Signal<bool>,
-    view: NodeHandle,
-    after_op: impl Fn() + 'static,
-) {
+/// `after_op` runs after each consumed, state-changing operation, once the
+/// render effects have flushed — the component uses it to reveal the caret and
+/// clamp the scroll. It is a plain callback, not an effect, on purpose: it
+/// writes the scroll signal, and a rinch signal write flushes subscribers
+/// synchronously, so doing it from inside an effect re-enters the running
+/// effect and panics ("RefCell already borrowed"). Input-handler context is the
+/// one kind verified safe for writes that flush (it is where `version.update`
+/// runs).
+#[derive(Clone)]
+pub(crate) struct InputCtx {
+    pub model: Rc<RefCell<EditorModel>>,
+    pub grid: Grid,
+    pub version: Signal<u64>,
+    pub focused: Signal<bool>,
+    pub cell_w: Memo<f32>,
+    pub scroll_top: Signal<f64>,
+    pub view: NodeHandle,
+    pub after_op: Rc<dyn Fn()>,
+}
+
+/// Install the global keyboard interceptor. It drives the model, bumps the
+/// version so the reactive render repaints, and does nothing unless `focused`
+/// is set.
+pub(crate) fn install(ctx: InputCtx) {
     set_keyboard_interceptor(move |ev| {
-        if !focused.get() {
+        if !ctx.focused.get() {
             return false;
         }
         // A page is the count of fully visible lines, measured fresh each press
         // so it tracks the window size for free (Monaco's pageSize).
         let page_lines = {
-            let lines = (view.client_height() as f32 / LINE_HEIGHT) as usize;
+            let lines = (ctx.view.client_height() as f32 / LINE_HEIGHT) as usize;
             if lines > 0 {
                 lines
             } else {
@@ -74,15 +85,15 @@ pub(crate) fn install(
         // the reactive render effects synchronously, and those read the model —
         // so its borrow must be released first, or they panic on a double borrow.
         let outcome = {
-            let mut m = model.borrow_mut();
-            apply(&mut m, &grid, ev, page_lines)
+            let mut m = ctx.model.borrow_mut();
+            apply(&mut m, &ctx.grid, ev, page_lines)
         };
         match outcome {
             None => false,
             Some(changed) => {
                 if changed {
-                    version.update(|v| *v = v.wrapping_add(1));
-                    after_op();
+                    ctx.version.update(|v| *v = v.wrapping_add(1));
+                    (ctx.after_op)();
                 }
                 true
             }
@@ -90,55 +101,70 @@ pub(crate) fn install(
     });
 }
 
+/// The char offset under a document-space point: the line under `y` (clamped
+/// into the document), then the nearest character boundary to `x` on it —
+/// Monaco's midpoint rule, via the grid. `x` is pixels from the glyph origin;
+/// `cell_w` is the measured cell advance. `line_text` carries no terminator, so
+/// a point past the end of a line lands at the line end for free.
+fn hit_offset(m: &EditorModel, grid: &Grid, cell_w: f32, x: f32, y: f32) -> usize {
+    let line = grid.line_at_y(y, m.len_lines());
+    let text = m.buffer().line_text(line);
+    let col = grid.char_column_at_visual(&text, x / cell_w);
+    m.buffer().offset_of(Position::new(line, col))
+}
+
 /// Build the `onmousedown` handler for the layer stack: place the caret at the
-/// pressed position, or extend the primary selection there when Shift is held.
-/// Also takes focus, so a press anywhere in the text starts routing keys here.
+/// pressed position (Shift extends the primary selection there instead), then
+/// capture the pointer for drag selection until mouseup. Also takes focus, so a
+/// press anywhere in the text starts routing keys here.
 ///
 /// The handler element is the document-sized layer stack, which scrolls with the
 /// text, and rinch's mouse dispatch subtracts ancestor scroll offsets when it
-/// computes the handler element's bounds — so the element-relative position *is*
-/// the document position, with no scroll arithmetic here at all. Horizontal
-/// hit-testing subtracts the shared text pad, converts pixels to visual columns
-/// through the measured cell advance, and lets the grid snap to the nearest
-/// character boundary (Monaco's midpoint rule); `line_at_y` clamps a press below
-/// the last line onto it, and `line_text` carries no terminator so a press past
-/// the end of a line lands at the line end.
-pub(crate) fn text_mousedown(
-    model: Rc<RefCell<EditorModel>>,
-    grid: Grid,
-    version: Signal<u64>,
-    focused: Signal<bool>,
-    cell_w: Memo<f32>,
-    view: NodeHandle,
-    after_op: Rc<dyn Fn()>,
-) -> impl Fn() {
+/// computes the handler element's bounds — so the element-relative press
+/// position *is* the document position, with no scroll arithmetic at all.
+///
+/// The drag goes through rinch's `Drag` pointer capture: `on_move` keeps firing
+/// with viewport coordinates wherever the pointer goes (over the gutter, off the
+/// editor) until mouseup lands anywhere, so there are no dead zones and no stuck
+/// drags. Two coordinate subtleties in the capture:
+///
+/// - The layer stack's bounds go stale the moment the drag scrolls (it moves
+///   with the text), so the drag captures the *scroll container's* viewport
+///   origin instead — `element_y + scroll_top` — which holds still while the
+///   document slides under it; each move then adds the live `scroll_top` back.
+/// - Extending to a line outside the viewport reveals it (`after_op`), which
+///   scrolls the view — so dragging at the edge advances line by line as the
+///   pointer moves. Continuous timer-driven auto-scroll while the pointer rests
+///   past the edge is Monaco behavior deferred to the polish increment.
+pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
     move || {
-        focused.set(true);
-        let ctx = get_click_context();
-        if ctx.button != MouseButton::Left {
+        ctx.focused.set(true);
+        let click = get_click_context();
+        if click.button != MouseButton::Left {
             return;
         }
         // Step aside for a scrollbar grab (the strip only exists when the
         // document overflows the viewport; the layer stack's height is the
         // document's).
-        let viewport = view.client_height() as f32;
+        let viewport = ctx.view.client_height() as f32;
         if viewport > 0.0
-            && ctx.element_height > viewport
-            && ctx.mouse_x >= ctx.element_x + ctx.element_width - SCROLLBAR_HIT_WIDTH
+            && click.element_height > viewport
+            && click.mouse_x >= click.element_x + click.element_width - SCROLLBAR_HIT_WIDTH
         {
             return;
         }
-        let x = ctx.mouse_x - ctx.element_x - TEXT_PAD_LEFT;
-        let y = ctx.mouse_y - ctx.element_y;
         // Confine the borrow, as in the interceptor: the version bump below
         // flushes render effects that borrow the model.
         {
-            let mut m = model.borrow_mut();
-            let line = grid.line_at_y(y, m.len_lines());
-            let text = m.buffer().line_text(line);
-            let col = grid.char_column_at_visual(&text, x / cell_w.get());
-            let offset = m.buffer().offset_of(Position::new(line, col));
-            if ctx.modifiers.shift {
+            let mut m = ctx.model.borrow_mut();
+            let offset = hit_offset(
+                &m,
+                &ctx.grid,
+                ctx.cell_w.get(),
+                click.mouse_x - click.element_x - TEXT_PAD_LEFT,
+                click.mouse_y - click.element_y,
+            );
+            if click.modifiers.shift {
                 let anchor = m.selections().primary().anchor;
                 m.set_selections(Selections::single(Selection::new(anchor, offset)));
             } else {
@@ -148,8 +174,42 @@ pub(crate) fn text_mousedown(
         // Repaint unconditionally: even a press on the caret's own cell can
         // collapse a selection or a multi-cursor set, and a redundant repaint of
         // an unchanged frame is cheap next to detecting one.
-        version.update(|v| *v = v.wrapping_add(1));
-        after_op();
+        ctx.version.update(|v| *v = v.wrapping_add(1));
+        (ctx.after_op)();
+
+        // Capture the pointer for the selection drag. The anchor is re-read from
+        // the model on every move (not captured here) so the drag keeps working
+        // off the live primary selection — this is also what makes Shift+press
+        // followed by a drag extend from the original anchor, as Monaco does.
+        let origin_x = click.element_x + TEXT_PAD_LEFT;
+        let view_top = click.element_y + ctx.scroll_top.get() as f32;
+        let drag = ctx.clone();
+        Drag::absolute()
+            .on_move(move |mx, my| {
+                let changed = {
+                    let mut m = drag.model.borrow_mut();
+                    let doc_y = my - view_top + drag.scroll_top.get() as f32;
+                    let offset =
+                        hit_offset(&m, &drag.grid, drag.cell_w.get(), mx - origin_x, doc_y);
+                    let primary = *m.selections().primary();
+                    // Moves within the same cell change nothing — skip the
+                    // repaint; mousemove arrives per pixel, cells are ~8px.
+                    if offset == primary.head {
+                        false
+                    } else {
+                        m.set_selections(Selections::single(Selection::new(
+                            primary.anchor,
+                            offset,
+                        )));
+                        true
+                    }
+                };
+                if changed {
+                    drag.version.update(|v| *v = v.wrapping_add(1));
+                    (drag.after_op)();
+                }
+            })
+            .start();
     }
 }
 

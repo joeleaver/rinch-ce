@@ -30,11 +30,13 @@
 //!   caret and clamp the scroll from the interceptor path — see the
 //!   `reveal_and_clamp` comment for why that must not be an effect.
 //!
-//! - **Mouse placement.** A press in the text places the caret at the nearest
+//! - **Mouse selection.** A press in the text places the caret at the nearest
 //!   character boundary (Monaco's midpoint rule); Shift+press extends the
-//!   primary selection. See [`mod@input`].
+//!   primary selection; dragging extends it continuously under pointer capture,
+//!   revealing as it crosses the viewport edge. See [`mod@input`].
 //!
-//! Still to come: drag selection, then the polish increment.
+//! Still to come: the polish increment (caret blink, word/line select on
+//! double/triple press, timer-driven drag auto-scroll, the resize clamp gap).
 
 mod highlight;
 mod input;
@@ -155,10 +157,6 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
             }
         }
     });
-    input::install(model.clone(), grid, version, focused, view.clone(), {
-        let r = reveal_and_clamp.clone();
-        move || r()
-    });
 
     // A hidden probe of known length: its measured width divided by its length is
     // the advance of one monospace cell.
@@ -241,21 +239,26 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
         }
     });
 
-    // Click-to-place-caret. The handler goes on the layer stack — document-sized
-    // and scrolling with the text — so the press's element-relative position is
-    // already a document position; the conversion to a line and column lives in
+    // The input surfaces, wired to one shared context: the global keyboard
+    // interceptor, and mouse placement/drag selection on the layer stack. The
+    // mousedown handler goes on the layer stack — document-sized and scrolling
+    // with the text — so the press's element-relative position is already a
+    // document position; the conversion to a line and column lives in
     // [`input::text_mousedown`]. Because rinch dispatches a mousedown to the
-    // *nearest* ancestor carrying the attribute, this handler shadows the editor
+    // *nearest* ancestor carrying the attribute, that handler shadows the editor
     // root's focus-only one everywhere in the text area, so it takes focus too.
-    let on_text_mousedown = input::text_mousedown(
-        model.clone(),
+    let input_ctx = input::InputCtx {
+        model: model.clone(),
         grid,
         version,
         focused,
         cell_w,
-        view.clone(),
-        reveal_and_clamp.clone(),
-    );
+        scroll_top,
+        view: view.clone(),
+        after_op: reveal_and_clamp,
+    };
+    input::install(input_ctx.clone());
+    let on_text_mousedown = input::text_mousedown(input_ctx);
 
     // The layer stack, sized to the whole document (the scroll spacer). Children
     // are z-ordered: current-line band, selection, text, caret. Only the visible
