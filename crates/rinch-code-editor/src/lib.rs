@@ -30,7 +30,11 @@
 //!   caret and clamp the scroll from the interceptor path — see the
 //!   `reveal_and_clamp` comment for why that must not be an effect.
 //!
-//! Still to come: click-to-place-caret hit testing, then the polish increment.
+//! - **Mouse placement.** A press in the text places the caret at the nearest
+//!   character boundary (Monaco's midpoint rule); Shift+press extends the
+//!   primary selection. See [`mod@input`].
+//!
+//! Still to come: drag selection, then the polish increment.
 
 mod highlight;
 mod input;
@@ -110,15 +114,16 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     // step: the viewport height does not change on edits, so recomputing rinch's
     // own max-scroll is exact.
     //
-    // This is a plain callback from the interceptor, NOT an effect, and that is
-    // load-bearing: it writes `scroll_top`, a rinch signal write flushes its
-    // subscribers synchronously, and a flush from inside a running effect
-    // re-enters it — "RefCell already borrowed". The interceptor path is the one
-    // context verified safe for flushing writes (it is where `version.update`
+    // This is a plain callback from input-handler context, NOT an effect, and
+    // that is load-bearing: it writes `scroll_top`, a rinch signal write flushes
+    // its subscribers synchronously, and a flush from inside a running effect
+    // re-enters it — "RefCell already borrowed". Interceptor and mouse-handler
+    // context is verified safe for flushing writes (it is where `version.update`
     // already runs); a window resize can still clamp silently, a known gap shared
     // with the synchronous viewport measurement below, left for the polish
-    // increment.
-    let reveal_and_clamp = {
+    // increment. `Rc` because both the keyboard interceptor and the mousedown
+    // handler run it after their ops.
+    let reveal_and_clamp: Rc<dyn Fn()> = Rc::new({
         let vh = view.clone();
         let m = model.clone();
         move || {
@@ -149,8 +154,11 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
                 scroll_top.set(new_st as f64);
             }
         }
-    };
-    input::install(model.clone(), grid, version, focused, reveal_and_clamp);
+    });
+    input::install(model.clone(), grid, version, focused, view.clone(), {
+        let r = reveal_and_clamp.clone();
+        move || r()
+    });
 
     // A hidden probe of known length: its measured width divided by its length is
     // the advance of one monospace cell.
@@ -233,6 +241,22 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
         }
     });
 
+    // Click-to-place-caret. The handler goes on the layer stack — document-sized
+    // and scrolling with the text — so the press's element-relative position is
+    // already a document position; the conversion to a line and column lives in
+    // [`input::text_mousedown`]. Because rinch dispatches a mousedown to the
+    // *nearest* ancestor carrying the attribute, this handler shadows the editor
+    // root's focus-only one everywhere in the text area, so it takes focus too.
+    let on_text_mousedown = input::text_mousedown(
+        model.clone(),
+        grid,
+        version,
+        focused,
+        cell_w,
+        view.clone(),
+        reveal_and_clamp.clone(),
+    );
+
     // The layer stack, sized to the whole document (the scroll spacer). Children
     // are z-ordered: current-line band, selection, text, caret. Only the visible
     // slice of rows is materialized; the caret and current-line band are single
@@ -240,6 +264,7 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     let layers = rsx! {
         div {
             style: { move || layers_style(content_h.get()) },
+            onmousedown: on_text_mousedown,
 
             // Current-line band (z 0) — full width, no measurement needed.
             div {
@@ -292,6 +317,9 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     rsx! {
         div {
             style: EDITOR_STYLE,
+            // Focus-only fallback: reached when a press misses the layer stack —
+            // the gutter, or below a document shorter than the viewport. (The
+            // layer-stack handler shadows this one over the text; see above.)
             onmousedown: move || focused.set(true),
 
             // Gutter: a clipped column whose inner band is translated to match the
