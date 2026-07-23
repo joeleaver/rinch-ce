@@ -2,18 +2,28 @@
 //!
 //! This crate wraps an automerge document whose `Text` object mirrors the
 //! editor's [`Buffer`](rinch_code_editor_buffer::Buffer), and speaks only
-//! *bytes*: sync-protocol messages out and in, ephemeral presence payloads
-//! out and in. It never opens a socket, holds a connection, or knows a
-//! network exists — the embedder pumps the bytes through whatever transport
-//! it already runs, exactly as automerge's own sync module is designed to be
-//! used. A reference websocket transport ships as a separate crate for the
-//! demo only.
+//! *bytes*: sync-protocol messages out and in. It never opens a socket, holds
+//! a connection, or knows a network exists — the embedder pumps the bytes
+//! through whatever transport it already runs, exactly as automerge's own sync
+//! module is designed to be used. A reference websocket transport ships as a
+//! separate crate for the demo only.
 //!
-//! # Status: Phase 3 scaffold
+//! Ephemeral presence (remote carets and selections) is a separate byte
+//! channel layered on in a later increment; this module is sync only.
 //!
-//! The crate currently pins its one load-bearing environmental assumption
-//! (see the test below); the collab core lands as Phase 3 increment C1. The
-//! full phase plan and research digest live in the project's session notes.
+//! # Shape
+//!
+//! - [`CollabDoc`] — the automerge mirror of one editor buffer. Local edits
+//!   go in as [`Change`](rinch_code_editor_buffer::Change)s; remote edits
+//!   come out as [`Splice`]s for the model to replay.
+//! - [`SyncSession`] — per-peer sync-protocol state; one per connection,
+//!   fresh on every reconnect.
+//! - The pump rule, framing requirements, and the create/join/load session
+//!   rules live in [`doc`]'s module docs.
+
+mod doc;
+
+pub use doc::{CollabDoc, CollabError, Splice, SyncSession};
 
 /// The whole crate's offset arithmetic assumes automerge indexes `Text` in
 /// Unicode scalar values — the same units as ropey's char indexing — which is
