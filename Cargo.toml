@@ -6,6 +6,7 @@ members = [
     "crates/rinch-code-editor-buffer",
     "crates/rinch-code-editor-syntax",
     "crates/rinch-code-editor-model",
+    "crates/rinch-code-editor-collab",
     "crates/rinch-code-editor",
     "examples/desktop-demo",
 ]
