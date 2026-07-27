@@ -3052,6 +3052,9 @@ dependencies = [
  "rinch-code-editor-buffer",
  "rinch-code-editor-model",
  "ropey",
+ "serde",
+ "serde_json",
+ "web-time",
  "yrs",
 ]
 

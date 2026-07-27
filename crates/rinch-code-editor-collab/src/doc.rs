@@ -34,21 +34,24 @@
 //! careless edit can silently corrupt, so it happens in exactly two functions
 //! and nowhere else.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rinch_code_editor_buffer::{Change, Splice};
+use rinch_code_editor_buffer::{Change, Selection, Splice};
 use ropey::Rope;
-use yrs::sync::{Message, SyncMessage};
+use yrs::sync::time::Clock;
+use yrs::sync::{Awareness, Message, SyncMessage};
 use yrs::types::Delta;
 use yrs::types::text::TextEvent;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Doc, GetString, Observable, OffsetKind, Options, Origin, Out, ReadTxn, StateVector,
-    Subscription, Text, TextRef, Transact, Update,
+    Assoc, Doc, GetString, IndexedSequence, Observable, OffsetKind, Options, Origin, Out, ReadTxn,
+    StateVector, StickyIndex, Subscription, Text, TextRef, Transact, Update,
 };
+
+use crate::presence::{Peer, PortableClock, PresenceState, StickyCursor, User};
 
 /// The key the shared text lives under. Root types in yrs are implicit and
 /// keyed by name, so two peers naming the same key get the *same* object with no
@@ -56,8 +59,13 @@ use yrs::{
 /// there is no "both sides created it" hazard to repair.
 const CONTENT: &str = "content";
 
-/// An update this document produced, tagged with the session it arrived on so
-/// it is never echoed back down that connection.
+/// A fully-encoded protocol message this document produced, tagged with the
+/// session it arrived on so it is never echoed back down that connection.
+///
+/// Encoded at production rather than at send because two different kinds of
+/// message share this queue — document updates and awareness — and their
+/// relative order matters: a caret that refers to an operation must not
+/// overtake the operation it refers to.
 type Outgoing = (Option<u64>, Vec<u8>);
 /// The shared outbox. `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` only because
 /// yrs requires observer closures to be `Send + Sync`; it is never contended.
@@ -89,9 +97,14 @@ pub struct SyncSession {
     id: u64,
     /// Whether our opening state vector has gone out.
     opened: bool,
-    /// A reply owed to this peer, produced while handling its last message.
-    /// Handed over by the next [`CollabDoc::generate_message`].
-    pending: Option<Vec<u8>>,
+    /// Replies owed to this peer, oldest first, produced while handling its
+    /// last messages. Drained one per [`CollabDoc::generate_message`].
+    ///
+    /// A queue rather than a single slot because more than one exchange can be
+    /// outstanding at once — a sync step 2 and an awareness reply are owed
+    /// independently, and a single slot silently dropped whichever was
+    /// answered second.
+    pending: VecDeque<Vec<u8>>,
     /// How far this peer has been caught up through the document's outbox.
     cursor: usize,
 }
@@ -108,7 +121,7 @@ impl SyncSession {
         Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             opened: false,
-            pending: None,
+            pending: VecDeque::new(),
             cursor: 0,
         }
     }
@@ -232,8 +245,20 @@ pub struct CollabDoc {
     cursors: HashMap<u64, usize>,
     /// Whether the content has arrived. A joiner is read-only until it has.
     synced: bool,
+    /// Ephemeral presence — carets, names, colours — over the y-protocols
+    /// awareness protocol. It shares this document (yrs `Doc` is an `Arc`
+    /// handle, so this is the *same* store, not a copy) because awareness is
+    /// keyed by the document's own client id.
+    awareness: Awareness,
+    /// Bumped whenever the set of peers or any peer's state actually changes,
+    /// so a reactive embedder can re-render presence without diffing.
+    /// Deliberately not bumped by a bare heartbeat, which changes a clock and
+    /// nothing a renderer can see.
+    presence_version: Arc<AtomicU64>,
     _sub: Subscription,
     _updates: Subscription,
+    _presence_out: Subscription,
+    _presence_change: Subscription,
 }
 
 impl std::fmt::Debug for CollabDoc {
@@ -273,11 +298,37 @@ impl CollabDoc {
             .observe_update_v1(move |txn, e| {
                 let from = txn.origin().and_then(origin_session);
                 if let Ok(mut out) = sink.lock() {
-                    out.push((from, e.update.clone()));
+                    out.push((
+                        from,
+                        encode(&Message::Sync(SyncMessage::Update(e.update.clone()))),
+                    ));
                 }
             })
             .expect("a fresh document accepts an update observer");
         let mirror = Rope::from_str(&text.get_string(&doc.transact()));
+
+        // Awareness rides the same connection and the same outbox as the
+        // document, so ordering between "I inserted this" and "my caret is
+        // against that insert" is preserved by construction.
+        let mut awareness = Awareness::with_clock(doc.clone(), PortableClock);
+        let sink = outbox.clone();
+        let presence_out = awareness.on_update(move |aware, e, origin| {
+            let from = origin.and_then(origin_session);
+            // Only the clients this event actually touched — awareness updates
+            // are deltas, never a full re-broadcast of everyone.
+            let Ok(update) = aware.update_with_clients(e.all_changes()) else {
+                return;
+            };
+            if let Ok(mut out) = sink.lock() {
+                out.push((from, encode(&Message::Awareness(update))));
+            }
+        });
+        let presence_version = Arc::new(AtomicU64::new(0));
+        let counter = presence_version.clone();
+        let presence_change = awareness.on_change(move |_, _, _| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
         Self {
             doc,
             text,
@@ -287,8 +338,12 @@ impl CollabDoc {
             trimmed: 0,
             cursors: HashMap::new(),
             synced,
+            awareness,
+            presence_version,
             _sub: sub,
             _updates: updates,
+            _presence_out: presence_out,
+            _presence_change: presence_change,
         }
     }
 
@@ -466,8 +521,8 @@ impl CollabDoc {
     /// See the module docs for the pump rule: call this for every peer after
     /// any local change or receive, until all peers return `None`.
     pub fn generate_message(&mut self, peer: &mut SyncSession) -> Option<Vec<u8>> {
-        // A reply owed from the last message we handled.
-        if let Some(bytes) = peer.pending.take() {
+        // A reply owed from a message we already handled.
+        if let Some(bytes) = peer.pending.pop_front() {
             return Some(bytes);
         }
 
@@ -478,11 +533,16 @@ impl CollabDoc {
             // handshake will reconcile, so it must not be replayed afterwards.
             peer.cursor = self.trimmed + self.outbox.lock().map_or(0, |o| o.len());
             self.cursors.insert(peer.id, peer.cursor);
+            // Ask who is here, straight after the document handshake. Without
+            // it a peer that has been idle since before we connected stays
+            // invisible until it happens to move — awareness is broadcast as
+            // deltas, so there is nothing in the outbox to replay.
+            peer.pending.push_back(encode(&Message::AwarenessQuery));
             let sv = self.doc.transact().state_vector();
             return Some(encode(&Message::Sync(SyncMessage::SyncStep1(sv))));
         }
 
-        // Steady state: the next update this peer has not seen, skipping the
+        // Steady state: the next message this peer has not seen, skipping the
         // ones it gave us in the first place.
         let next = {
             let outbox = self.outbox.lock().ok()?;
@@ -501,7 +561,7 @@ impl CollabDoc {
         };
         self.cursors.insert(peer.id, peer.cursor);
         self.trim_outbox();
-        next.map(|update| encode(&Message::Sync(SyncMessage::Update(update))))
+        next
     }
 
     /// Drop outbox entries every known session has consumed.
@@ -540,7 +600,8 @@ impl CollabDoc {
             Message::Sync(SyncMessage::SyncStep1(their_sv)) => {
                 // They told us what they have; owe them the difference.
                 let update = self.doc.transact().encode_diff_v1(&their_sv);
-                peer.pending = Some(encode(&Message::Sync(SyncMessage::SyncStep2(update))));
+                peer.pending
+                    .push_back(encode(&Message::Sync(SyncMessage::SyncStep2(update))));
                 Ok(Vec::new())
             }
             Message::Sync(SyncMessage::SyncStep2(update))
@@ -554,10 +615,28 @@ impl CollabDoc {
                 self.synced = true;
                 Ok(splices)
             }
-            // Awareness rides the same channel in the y-sync protocol. Presence
-            // is a later increment; ignoring these keeps us interoperable with
-            // peers that send them rather than treating them as corrupt.
-            Message::Awareness(_) | Message::AwarenessQuery | Message::Auth(_) => Ok(Vec::new()),
+            // Presence. Carries no text, so no splices — watch
+            // [`presence_version`](Self::presence_version) instead. A malformed
+            // awareness payload is the peer's fault like any other bad input,
+            // but it is *only* presence: dropping it costs a stale caret, not
+            // document integrity, so it is swallowed rather than escalated into
+            // a dropped connection.
+            Message::Awareness(update) => {
+                let _ = self
+                    .awareness
+                    .apply_update_with(update, session_origin(peer.id));
+                Ok(Vec::new())
+            }
+            // "Tell me who is here." Answer with everything we know, which is
+            // how a joiner learns about peers that have been idle since before
+            // it arrived and would otherwise stay invisible until they moved.
+            Message::AwarenessQuery => {
+                if let Ok(update) = self.awareness.update() {
+                    peer.pending.push_back(encode(&Message::Awareness(update)));
+                }
+                Ok(Vec::new())
+            }
+            Message::Auth(_) => Ok(Vec::new()),
             Message::Custom(_, _) => Ok(Vec::new()),
         }
     }
@@ -659,6 +738,203 @@ impl CollabDoc {
         } else {
             vec![Splice::new(0, old_len, truth)]
         }
+    }
+
+    // ── Presence ────────────────────────────────────────────────────────────
+
+    /// This document's own client id — the key peers will see it under.
+    pub fn local_id(&self) -> u64 {
+        self.awareness.client_id().get()
+    }
+
+    /// A counter bumped whenever any peer's presence actually changes.
+    ///
+    /// Presence carries no text, so [`receive_message`](Self::receive_message)
+    /// returns no splices for it; watch this instead and re-read
+    /// [`peers`](Self::peers) when it moves. A bare liveness heartbeat does
+    /// **not** bump it — it changes a clock and nothing anyone can see.
+    pub fn presence_version(&self) -> u64 {
+        self.presence_version.load(Ordering::Relaxed)
+    }
+
+    /// Announce who we are, replacing any identity already published.
+    ///
+    /// Publishing an identity is what makes this document visible to others at
+    /// all: a peer that never calls this is present in the protocol but absent
+    /// from every [`peers`](Self::peers) list, which is the right default for
+    /// an embedder that has not opted into presence.
+    pub fn set_local_user(&mut self, user: User) {
+        let cursor = self.local_state().and_then(|s| s.cursor);
+        self.publish(PresenceState { user, cursor });
+    }
+
+    /// Publish where our caret is, in **chars**.
+    ///
+    /// Offsets are resolved to [`StickyIndex`] anchors *now*, against the
+    /// document as it currently stands, so they keep pointing at the same text
+    /// through anyone's later edits. `None` means "present, but no caret here"
+    /// — what to publish when the editor loses focus.
+    ///
+    /// A no-op until [`set_local_user`](Self::set_local_user) has been called;
+    /// a caret with nobody attached to it cannot be drawn or labelled.
+    pub fn set_local_selection(&mut self, selection: Option<Selection>) {
+        let Some(state) = self.local_state() else {
+            return;
+        };
+        let cursor = selection.and_then(|sel| self.sticky_cursor(sel));
+        self.publish(PresenceState {
+            user: state.user,
+            cursor,
+        });
+    }
+
+    /// Withdraw from the document — the explicit "I am leaving" every other
+    /// peer needs to drop our caret at once rather than waiting out
+    /// [`PEER_TIMEOUT_MS`](crate::PEER_TIMEOUT_MS).
+    ///
+    /// Pump afterwards, or nobody hears it.
+    pub fn clear_local_presence(&mut self) {
+        self.awareness.clean_local_state();
+    }
+
+    /// Re-announce our own state to keep it from ageing out.
+    ///
+    /// Call every [`HEARTBEAT_MS`](crate::HEARTBEAT_MS) while connected, then
+    /// pump. It re-publishes an identical state on purpose: the awareness clock
+    /// increments on every set, and that increment *is* the liveness signal.
+    /// Doing nothing when idle is what makes a peer look departed.
+    pub fn presence_heartbeat(&mut self) {
+        if let Some(state) = self.local_state() {
+            self.publish(state);
+        }
+    }
+
+    /// Drop peers that have not been heard from within `timeout_ms`, returning
+    /// the ones removed.
+    ///
+    /// Call every [`SWEEP_MS`](crate::SWEEP_MS) with
+    /// [`PEER_TIMEOUT_MS`](crate::PEER_TIMEOUT_MS). This is the only thing that
+    /// clears a peer whose connection died without a goodbye — a closed laptop
+    /// sends no "leave" message.
+    pub fn expire_stale_peers(&mut self, timeout_ms: u64) -> Vec<u64> {
+        let now = PortableClock.now();
+        let local = self.awareness.client_id();
+        // yrs's ClientID is a newtype; it stays inside this crate and only its
+        // yjs-compatible u64 value crosses the public boundary.
+        let stale: Vec<_> = self
+            .awareness
+            .iter()
+            .filter(|(id, _)| *id != local)
+            .filter_map(|(id, _)| {
+                let (_, last_seen) = self.awareness.meta(id)?;
+                (now.saturating_sub(last_seen) > timeout_ms).then_some(id)
+            })
+            .collect();
+        for id in &stale {
+            self.awareness.remove_state(*id);
+        }
+        stale.into_iter().map(|id| id.get()).collect()
+    }
+
+    /// Everyone else currently in the document, with their carets resolved to
+    /// char offsets **as of now**.
+    ///
+    /// Excludes us. Peers that have not published a [`User`] are omitted: they
+    /// are in the protocol but have nothing renderable. Order is unspecified —
+    /// key off [`Peer::id`].
+    pub fn peers(&self) -> Vec<Peer> {
+        let local = self.awareness.client_id();
+        let txn = self.doc.transact();
+        self.awareness
+            .iter()
+            .filter(|(id, _)| *id != local)
+            .filter_map(|(id, _)| {
+                let state: PresenceState = self.awareness.state(id)?;
+                let selection = state
+                    .cursor
+                    .and_then(|c| {
+                        Some(Selection::new(
+                            self.resolve(&txn, &c.anchor)?,
+                            self.resolve(&txn, &c.head)?,
+                        ))
+                    })
+                    .map(|mut sel| {
+                        // An anchor can outlive the text it named, landing past the
+                        // end after a concurrent delete. Clamping keeps a stale
+                        // caret drawable instead of panicking the renderer.
+                        let len = self.mirror.len_chars();
+                        sel.anchor = sel.anchor.min(len);
+                        sel.head = sel.head.min(len);
+                        sel
+                    });
+                Some(Peer {
+                    id: id.get(),
+                    user: state.user,
+                    selection,
+                })
+            })
+            .collect()
+    }
+
+    /// Our own published state, if any.
+    fn local_state(&self) -> Option<PresenceState> {
+        self.awareness.local_state()
+    }
+
+    /// Publish a state, letting the failure to serialize it be unreachable
+    /// rather than merely unlikely: every field is a `String` or a
+    /// [`StickyIndex`], and neither can fail to become JSON.
+    fn publish(&mut self, state: PresenceState) {
+        let _ = self.awareness.set_local_state(state);
+    }
+
+    /// Turn a char-offset selection into op-identity anchors.
+    ///
+    /// The offsets cross the same chars → UTF-16 boundary as everything else
+    /// here, through the mirror.
+    /// Note the **read** transaction: naming a position does not modify the
+    /// document, and taking a write transaction here would open the door to
+    /// presence emitting document updates — the thing
+    /// `publishing_presence_does_not_change_the_document` exists to forbid.
+    fn sticky_cursor(&self, sel: Selection) -> Option<StickyCursor> {
+        let len = self.mirror.len_chars();
+        let anchor_cu = self.mirror.char_to_utf16_cu(sel.anchor.min(len)) as u32;
+        let head_cu = self.mirror.char_to_utf16_cu(sel.head.min(len)) as u32;
+        let txn = self.doc.transact();
+        Some(StickyCursor {
+            anchor: Self::anchor_at(&self.text, &txn, anchor_cu)?,
+            head: Self::anchor_at(&self.text, &txn, head_cu)?,
+        })
+    }
+
+    /// Anchor one offset, preferring the association that makes a caret behave.
+    ///
+    /// `Assoc::After` is the one we want nearly everywhere: it names the
+    /// operation the caret sits *before*, so text a peer types at that exact
+    /// spot appears after the caret rather than pushing it along — which is
+    /// what a human expects to watch happen, and y-codemirror's choice.
+    ///
+    /// But `Assoc::After` **cannot be represented at the end of the document**:
+    /// yrs walks to the requested index and, finding nothing after it to name,
+    /// returns `None`. (yrs is stricter than Yjs here, which falls through to a
+    /// position relative to the type itself.) Left unhandled that silently
+    /// drops the single most common caret position there is — the end of the
+    /// file — and only that one, which is exactly the kind of hole that reaches
+    /// production. So the end of the document anchors `Before` the last
+    /// character instead, which resolves back to the same offset and keeps the
+    /// same behaviour: appended text still lands after the caret.
+    fn anchor_at<T: ReadTxn>(text: &TextRef, txn: &T, offset_cu: u32) -> Option<StickyIndex> {
+        if let Some(at) = text.sticky_index(txn, offset_cu, Assoc::After) {
+            return Some(at);
+        }
+        text.sticky_index(txn, offset_cu, Assoc::Before)
+    }
+
+    /// Resolve an anchor back to a char offset against the document as it is.
+    fn resolve<T: ReadTxn>(&self, txn: &T, at: &StickyIndex) -> Option<usize> {
+        let offset = at.get_offset(txn)?;
+        let cu = (offset.index as usize).min(self.mirror.len_utf16_cu());
+        Some(self.mirror.utf16_cu_to_char(cu))
     }
 
     /// Assert the mirror still holds exactly what the document holds.

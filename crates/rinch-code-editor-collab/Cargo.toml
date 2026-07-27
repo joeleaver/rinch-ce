@@ -20,7 +20,22 @@ ropey.workspace = true
 
 rinch-code-editor-buffer.workspace = true
 
+# Presence state is JSON on the wire, because that is what y-protocols
+# awareness carries and what the Yjs ecosystem reads. Both are already
+# non-optional dependencies of yrs itself, so this costs nothing to add.
+serde = { version = "1", features = ["derive"] }
+
+# A clock that exists on wasm32-unknown-unknown. yrs's own SystemClock is
+# compiled out there (and `Awareness::new` with it), exactly like
+# `UndoManager::new` -- so awareness is always built via `with_clock`. Same
+# crate rinch and the editor crate already use.
+web-time = "1"
+
 [dev-dependencies]
+# Only to pin the presence wire format against the shape Yjs publishes; the
+# crate itself never names a JSON representation, it just derives one.
+serde_json = "1"
+
 # Not a dependency of this crate and never will be: nothing here knows what an
 # editor is. It appears only in `model_sync.rs`, which drives two real
 # `EditorModel`s through two documents to pin the integration contract end to

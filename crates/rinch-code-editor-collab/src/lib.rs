@@ -11,9 +11,10 @@
 //! format is the y-sync protocol, so a session can talk to the existing Yjs
 //! server ecosystem rather than only to itself.
 //!
-//! Ephemeral presence (remote carets and selections) rides the same channel as
-//! y-sync's awareness messages; wiring it up is a later increment, and until
-//! then those messages are accepted and ignored rather than treated as corrupt.
+//! Ephemeral presence — remote carets, selections, names and colours — rides
+//! the same channel as y-sync's awareness messages, through the same pump. It
+//! never touches the document: presence is published and read separately, and
+//! carries no text.
 //!
 //! # Shape
 //!
@@ -22,12 +23,27 @@
 //!   [`Splice`]s for the model to replay.
 //! - [`SyncSession`] — per-peer protocol state; one per connection, fresh on
 //!   every reconnect.
+//! - [`User`] and [`Peer`] — presence in and out. Publish with
+//!   `set_local_user`/`set_local_selection`, read with `peers()`, and re-render
+//!   when `presence_version()` moves.
 //! - The pump rule, framing requirements, offset handling, and the
-//!   create/join/load session rules live in [`doc`]'s module docs.
+//!   create/join/load session rules live in [`doc`]'s module docs; what goes
+//!   into a presence state, and why it is shaped the way Yjs shapes it, lives
+//!   in [`presence`]'s.
+//!
+//! # Driving presence
+//!
+//! Two things the embedder must run on timers, because this crate owns no
+//! clock of its own beyond reading one: [`CollabDoc::presence_heartbeat`] every
+//! [`HEARTBEAT_MS`], and [`CollabDoc::expire_stale_peers`] every [`SWEEP_MS`]
+//! with [`PEER_TIMEOUT_MS`]. Skip the first and other peers will decide you
+//! left; skip the second and the carets of people who crashed never go away.
 
 mod doc;
+mod presence;
 
 pub use doc::{CollabDoc, CollabError, SyncSession};
+pub use presence::{HEARTBEAT_MS, PEER_TIMEOUT_MS, Peer, SWEEP_MS, Selection, User};
 
 /// The unit of remote edit this crate emits, owned by the buffer crate because
 /// the editor model applies them and neither layer should have to learn the
