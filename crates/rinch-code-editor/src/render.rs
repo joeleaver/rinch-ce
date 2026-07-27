@@ -16,9 +16,12 @@
 //! gutter) do the rest. The caret and current-line band are single elements the
 //! component renders unconditionally, so they are not sliced here.
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
-use rinch_code_editor_model::{EditorModel, Grid, Theme, TokenMetadata};
+use rinch::core::Memo;
+use rinch_code_editor_model::{EditorModel, Grid, Theme, TokenMetadata, selection_spans};
 
 use crate::styles::LINE_HEIGHT;
 
@@ -107,50 +110,31 @@ pub(crate) fn compute_gutter(range: Range<usize>, line_count: usize) -> Vec<Gutt
 }
 
 /// The selection rectangles for every non-empty selection, clipped to the visible
-/// `range`, in grid coordinates. Clipping matters: a select-all on a large file
-/// would otherwise emit a rectangle per line. A line whose terminator is inside
-/// the selection shows a one-cell sliver past its content, so a selected line
-/// break reads as selected.
+/// `range`, in grid coordinates.
+///
+/// The splitting itself — the clip, the one-cell sliver for a selected line
+/// break, dropping empty rectangles — lives in the model crate's
+/// [`selection_spans`], because a *collaborator's* selection is drawn by exactly
+/// the same rules and the two must not be able to drift apart. All that is left
+/// here is the running key the reconciler diffs on.
 pub(crate) fn compute_sel_rects(
     model: &EditorModel,
     grid: &Grid,
     range: Range<usize>,
 ) -> Vec<SelRect> {
     let buffer = model.buffer();
-    let mut rects = Vec::new();
-    let mut key = 0;
-    for sel in model.selections().iter() {
-        if sel.is_empty() {
-            continue;
-        }
-        let start = buffer.position_of(sel.start());
-        let end = buffer.position_of(sel.end());
-        let first = start.line.max(range.start);
-        let last = end.line.min(range.end.saturating_sub(1));
-        for line in first..=last {
-            let line_text = buffer.line_text(line);
-            let content_len = buffer.line_len(line);
-            let s_col = if line == start.line { start.col } else { 0 };
-            let e_col = if line == end.line {
-                end.col
-            } else {
-                content_len
-            };
-            let start_vcol = grid.visual_column(&line_text, s_col);
-            let mut end_vcol = grid.visual_column(&line_text, e_col);
-            if line < end.line {
-                end_vcol += 1;
-            }
-            rects.push(SelRect {
-                key,
-                line,
-                start_vcol,
-                end_vcol,
-            });
-            key += 1;
-        }
-    }
-    rects
+    model
+        .selections()
+        .iter()
+        .flat_map(|sel| selection_spans(buffer, grid, *sel, range.clone()))
+        .enumerate()
+        .map(|(key, span)| SelRect {
+            key,
+            line: span.line,
+            start_vcol: span.start_vcol,
+            end_vcol: span.end_vcol,
+        })
+        .collect()
 }
 
 /// The primary caret's grid position: `(line, visual_column)`.
@@ -170,6 +154,46 @@ pub(crate) fn caret_line(model: &EditorModel) -> usize {
 /// Total pixel height of the document; the layer stack is sized to this.
 pub(crate) fn content_height(model: &EditorModel) -> f32 {
     model.len_lines() as f32 * LINE_HEIGHT
+}
+
+// ---- reactive reads --------------------------------------------------------
+//
+// The component calls each of these from inside an rsx `for`. Every one reads the
+// `visible` memo first — establishing the reactive dependency on both the document
+// version and the scroll position that memo folds in — then returns freshly
+// computed render data for that window.
+//
+// They are named functions, and they live here rather than inline in the
+// component, for a reason that is pure macro mechanics: an rsx `for`'s iterator
+// expression is parsed only up to the first `{`, so it cannot itself be a block.
+// A call is unambiguous. The component imports them by name (rather than calling
+// them through the module path) because the `for` macro captures and clones the
+// idents its iterator expression references, and a module path is not a value.
+
+pub(crate) fn gutter_rows(
+    visible: Memo<Range<usize>>,
+    model: &Rc<RefCell<EditorModel>>,
+) -> Vec<GutterRow> {
+    let range = visible.get();
+    compute_gutter(range, model.borrow().len_lines())
+}
+
+pub(crate) fn selection_rects(
+    visible: Memo<Range<usize>>,
+    model: &Rc<RefCell<EditorModel>>,
+    grid: Grid,
+) -> Vec<SelRect> {
+    let range = visible.get();
+    compute_sel_rects(&model.borrow(), &grid, range)
+}
+
+pub(crate) fn text_rows(
+    visible: Memo<Range<usize>>,
+    model: &Rc<RefCell<EditorModel>>,
+    default_color: &str,
+) -> Vec<LineRender> {
+    let range = visible.get();
+    compute_lines(&mut model.borrow_mut(), range, default_color)
 }
 
 /// A token's foreground as a CSS colour, falling back to the editor default when

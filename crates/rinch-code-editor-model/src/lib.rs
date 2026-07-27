@@ -36,6 +36,13 @@
 //! geometry live above this crate. The model moves selections only as a
 //! consequence of an edit; asking it to move the caret one column left is the
 //! view layer's job, because that needs the visual line model the view builds.
+//!
+//! *Grid* geometry, though, is ours: [`Grid`] measures visual columns, and
+//! [`selection_spans`] turns a selection into the per-line rectangles that draw
+//! it. Both are exact without a font, so both are tested here rather than in a
+//! screenshot. [`mod@presence`] builds on them to place collaborators' carets
+//! and selections — see its docs for why a remote caret is this crate's business
+//! and not the collaborative crate's.
 
 mod clipboard;
 mod collab;
@@ -43,13 +50,20 @@ mod cursor;
 mod geometry;
 mod graphemes;
 mod model;
+mod presence;
 mod select;
+mod spans;
 
 pub use clipboard::ClipboardPayload;
 pub use cursor::Motion;
 pub use geometry::Grid;
 pub use model::{EditKind, EditSummary, EditorModel};
+pub use presence::{
+    PresenceCaret, PresenceRect, RemotePresence, TINT_ALPHA, presence_carets, presence_rects,
+    readable_on, with_alpha,
+};
 pub use select::{extend_from, line_drag, line_range_at, word_drag, word_range_at};
+pub use spans::{LineSpan, selection_spans};
 
 // Re-export the foundation types a caller needs to drive the model, so a
 // downstream view can depend on this one crate for the whole editing surface —

@@ -39,9 +39,11 @@
 //!   the caret's line, multi-cursor copies distribute back piece-per-cursor —
 //!   through `rinch::clipboard` plus Monaco's in-memory metadata store. See
 //!   [`mod@clipboard`] (and its web caveat).
-//!
-//! Still to come, in the rest of this increment: caret blink, word/line select
-//! on double/triple press, timer-driven drag auto-scroll, the resize clamp gap.
+//! - **Collaborators.** Given a `peers` signal, the editor draws everyone else's
+//!   selection, caret and name — tinted behind the glyphs, the caret solid in
+//!   front, the name chip up for a moment after they move. Where the presence
+//!   comes from is not this crate's business: it takes plain
+//!   [`RemotePresence`]es and never mentions a network. See [`mod@presence`].
 
 mod autoscroll;
 mod blink;
@@ -49,20 +51,33 @@ mod clipboard;
 mod highlight;
 mod input;
 mod mouse;
+mod presence;
 mod render;
+mod scroll;
 mod styles;
 
 use std::cell::RefCell;
-use std::ops::Range;
 use std::rc::Rc;
 
 use rinch::prelude::*;
 use rinch_code_editor_model::{EditorModel, Grid};
 
+/// How a collaborator is described to the editor, and the two types it is built
+/// from. Re-exported so an embedder needs only this crate to feed presence in —
+/// mapping its own peer type (a `rinch_code_editor_collab::Peer`, or anything
+/// else) into these.
+pub use rinch_code_editor_model::{RemotePresence, Rgba, Selection};
+
+// Imported by name, not called through `render::`: the rsx `for` macro captures
+// and clones the idents its iterator expression names, and a module path is not
+// a value. See the note above their definitions.
+use presence::{ChipClock, remote_carets, remote_chips, remote_dots, remote_rects};
+use render::{gutter_rows, selection_rects, text_rows};
 use styles::{
     EDITOR_STYLE, FALLBACK_CELL_WIDTH, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, TAB_SIZE, VIEW_STYLE,
     caret_style, current_line_style, gutter_scroll_style, gutter_style, layers_style, line_style,
-    number_style, sel_rect_style,
+    number_style, remote_caret_style, remote_chip_style, remote_dot_style, remote_sel_rect_style,
+    sel_rect_style,
 };
 
 /// Extra lines rendered above and below the viewport so a fast scroll does not
@@ -77,8 +92,22 @@ const FALLBACK_VIEWPORT_H: f32 = 1200.0;
 /// The editor component. `text` is the initial document; `language` names a
 /// bundled grammar (e.g. `"rust"`) — an empty or not-compiled-in language renders
 /// as plain text.
+///
+/// `peers` are the collaborators to draw. It is a [`Signal`] and not a plain
+/// `Vec` because a component's body runs exactly once, so anything passed by
+/// value is frozen at mount; the embedder writes the signal as presence arrives
+/// and the overlays follow. Leaving it out gives an empty list and an editor
+/// that renders nobody, which is what a non-collaborative editor wants.
+///
+/// Pass the signal *itself*, never a closure producing one: a closure-valued
+/// prop makes rinch treat the whole component as reactive and rebuild its entire
+/// subtree on every presence update.
 #[component]
-pub fn CodeEditor(text: String, language: String) -> NodeHandle {
+pub fn CodeEditor(
+    text: String,
+    language: String,
+    peers: Signal<Vec<RemotePresence>>,
+) -> NodeHandle {
     // Build the theme, read the default foreground off it (the fallback colour for
     // an unstyled token), then hand the theme to the highlighter it colours through.
     let theme = highlight::dark_theme();
@@ -115,55 +144,12 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     let scroll_handler = __scope.register_scroll_handler(move |st| scroll_top.set(st));
     view.set_attribute("data-onscroll", &scroll_handler.0.to_string());
 
-    // Reveal-and-clamp, run by the interceptor after every state-changing key.
-    // Two jobs in one adjustment: bring the caret's line back into the viewport
-    // when a move or edit pushed it out, and clamp the scroll when the document
-    // shrank (undo, delete) — rinch's layout clamps the DOM offset silently in
-    // that case (the clamp runs inside layout resolution, where firing `onscroll`
-    // is unsafe), which would strand `scroll_top` and the gutter band translated
-    // by it at the stale value. Mirroring the clamp here keeps signal and DOM in
-    // step: the viewport height does not change on edits, so recomputing rinch's
-    // own max-scroll is exact.
-    //
-    // This is a plain callback from input-handler context, NOT an effect, and
-    // that is load-bearing: it writes `scroll_top`, a rinch signal write flushes
-    // its subscribers synchronously, and a flush from inside a running effect
-    // re-enters it — "RefCell already borrowed". Interceptor and mouse-handler
-    // context is verified safe for flushing writes (it is where `version.update`
-    // already runs). A window resize can still clamp silently — rinch fires no
-    // resize event — which the blink tick's reconciler covers; see [`mod@blink`].
-    let reveal_and_clamp = {
-        let vh = view.clone();
-        let m = model.clone();
-        move || {
-            let viewport = vh.client_height() as f32;
-            if viewport <= 0.0 {
-                return;
-            }
-            let (line, content) = {
-                let mb = m.borrow();
-                (
-                    render::caret_grid(&mb, &grid).0,
-                    render::content_height(&mb),
-                )
-            };
-            let st = scroll_top.get() as f32;
-            let top = line as f32 * LINE_HEIGHT;
-            let bottom = top + LINE_HEIGHT;
-            let revealed = if top < st {
-                top
-            } else if bottom > st + viewport {
-                bottom - viewport
-            } else {
-                st
-            };
-            let new_st = revealed.min((content - viewport).max(0.0)).max(0.0);
-            if new_st != st {
-                vh.set_scroll_top(new_st as f64);
-                scroll_top.set(new_st as f64);
-            }
-        }
-    };
+    // Reveal-and-clamp, run after every state-changing operation: bring the
+    // caret back into view, and mirror the clamp rinch's layout applies silently
+    // when the document shrinks under the viewport. It must stay a plain
+    // callback from input-handler context rather than an effect — see
+    // [`mod@scroll`] for both halves of the reasoning.
+    let reveal_and_clamp = scroll::reveal_and_clamp(view.clone(), model.clone(), grid, scroll_top);
 
     // The caret blinker: solid through activity, pulsing when idle, hidden
     // unfocused — its tick also reconciles the silent resize clamp. Restarted
@@ -175,6 +161,19 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
     __scope.on_cleanup({
         let blinker = blinker.clone();
         move || blinker.stop()
+    });
+
+    // Collaborators' name chips: up for a moment after that peer moves, then
+    // down again. The clock derives "that peer moved" by diffing the presence
+    // list against the last one it saw, and owns the timer that takes the chips
+    // down; `chip_tick` is that timer's only output, and exists purely to
+    // invalidate the render. Stopped on unmount for the blinker's reason — a
+    // parked timer callback holds an `Rc` of it.
+    let chip_tick = Signal::new(0u64);
+    let chips = ChipClock::new(chip_tick);
+    __scope.on_cleanup({
+        let chips = chips.clone();
+        move || chips.stop()
     });
 
     // Everything that runs after a state-changing operation, from the safe
@@ -336,6 +335,25 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
                 }
             }
 
+            // Collaborators' selections (z 1) — emitted after the local ones so
+            // that at equal depth, DOM order puts a peer's tint over yours.
+            for rect in remote_rects(visible, peers, &model, grid) {
+                div {
+                    key: format!("{}:{}", rect.peer, rect.span.line),
+                    style: {
+                        move || {
+                            remote_sel_rect_style(
+                                rect.span.line,
+                                rect.span.start_vcol,
+                                rect.span.end_vcol,
+                                cell_w.get(),
+                                rect.tint,
+                            )
+                        }
+                    },
+                }
+            }
+
             // Text rows (z 2) — visible slice only.
             for line in text_rows(visible, &model, &default_color) {
                 div {
@@ -363,6 +381,65 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
                         caret_style(line, vcol, cell_w.get(), shown)
                     }
                 },
+            }
+
+            // Collaborators' carets (z 3) — solid, never blinking: a blink means
+            // "your next keystroke lands here", which is a claim only the local
+            // caret can make.
+            //
+            // The `let`s live *inside* the style block, not in front of the
+            // element: a reactive style is re-evaluated on every effect run, so
+            // it may not move a non-`Copy` capture, and a `PresenceCaret` owns
+            // its name. Lifting the `Copy` fields out inside the block satisfies
+            // that (the block's setup runs each time, then returns the closure)
+            // without putting bindings in front of the element, where the macro
+            // would also copy them into the key closure and warn them unused.
+            for c in remote_carets(visible, peers, &model, grid) {
+                div {
+                    key: c.peer,
+                    style: {
+                        let (line, vcol) = (c.line, c.vcol);
+                        let (reversed, color) = (c.reversed, c.color);
+                        move || remote_caret_style(line, vcol, cell_w.get(), reversed, color)
+                    },
+                }
+            }
+
+            // The dot capping an idle collaborator's caret (z 4), and the name
+            // chip that replaces it while they are active. They are two loops
+            // over two disjoint lists rather than one list with a visibility
+            // flag: reconciliation reuses a node whose key has not changed, so a
+            // flag read at build time would never be re-read. Moving a peer
+            // between the lists is an insertion and a removal, which it handles.
+            for c in remote_dots(visible, peers, chip_tick, &chips, &model, grid) {
+                div {
+                    key: c.peer,
+                    style: {
+                        let (line, vcol) = (c.line, c.vcol);
+                        let (reversed, color) = (c.reversed, c.color);
+                        move || remote_dot_style(line, vcol, cell_w.get(), reversed, color)
+                    },
+                }
+            }
+
+            for c in remote_chips(visible, peers, chip_tick, &chips, &model, grid) {
+                // The one binding that has to sit out here: the chip's text is a
+                // child node, and the style effect below captures `c` by move.
+                let name = c.name.clone();
+                div {
+                    // The name is part of the key, so a rename rebuilds the chip
+                    // — a text child is written once, when the node is built.
+                    key: format!("{}:{}", c.peer, name),
+                    style: {
+                        let (line, vcol) = (c.line, c.vcol);
+                        let (reversed, color) = (c.reversed, c.color);
+                        let label = c.label_color;
+                        move || {
+                            remote_chip_style(line, vcol, cell_w.get(), reversed, color, label)
+                        }
+                    },
+                    { name.clone() }
+                }
             }
 
             // The measurement probe (hidden).
@@ -406,38 +483,4 @@ pub fn CodeEditor(text: String, language: String) -> NodeHandle {
             { view }
         }
     }
-}
-
-// ---- reactive reads --------------------------------------------------------
-//
-// Each of these reads the `visible` memo — establishing the reactive dependency
-// on both the document version and the scroll position it folds in — then returns
-// freshly-computed render data for that window. They are named functions rather
-// than inline blocks because an rsx `for`'s iterator is parsed only up to the
-// first `{`, so its expression cannot itself be a block; a call is unambiguous.
-
-fn gutter_rows(
-    visible: Memo<Range<usize>>,
-    model: &Rc<RefCell<EditorModel>>,
-) -> Vec<render::GutterRow> {
-    let range = visible.get();
-    render::compute_gutter(range, model.borrow().len_lines())
-}
-
-fn selection_rects(
-    visible: Memo<Range<usize>>,
-    model: &Rc<RefCell<EditorModel>>,
-    grid: Grid,
-) -> Vec<render::SelRect> {
-    let range = visible.get();
-    render::compute_sel_rects(&model.borrow(), &grid, range)
-}
-
-fn text_rows(
-    visible: Memo<Range<usize>>,
-    model: &Rc<RefCell<EditorModel>>,
-    default_color: &str,
-) -> Vec<render::LineRender> {
-    let range = visible.get();
-    render::compute_lines(&mut model.borrow_mut(), range, default_color)
 }
