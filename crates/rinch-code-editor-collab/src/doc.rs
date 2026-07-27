@@ -100,6 +100,21 @@ pub enum CollabError {
     /// This is an integration bug, not a recoverable condition, and (unlike the
     /// peer-fault variants) is never reachable from network input.
     Internal(AutomergeError),
+    /// A local [`Change`] addressed text outside the shared document. Like
+    /// [`Internal`](Self::Internal) this means the model and the document have
+    /// disagreed about the contents, and it is a bug rather than something to
+    /// recover from — but it is caught *before* anything is applied, so the
+    /// document is untouched and still describes itself honestly. The embedder
+    /// should resynchronize the model from [`CollabDoc::text`] rather than
+    /// carry on.
+    OutOfRange {
+        /// The offending edit's start, in pre-change coordinates.
+        pos: usize,
+        /// How many chars it tried to remove.
+        del: usize,
+        /// The length of the shared text the change was validated against.
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for CollabError {
@@ -113,6 +128,10 @@ impl std::fmt::Display for CollabError {
             }
             Self::NotSynced => write!(f, "local edit before the first sync delivered the content"),
             Self::Internal(e) => write!(f, "internal automerge operation failed: {e}"),
+            Self::OutOfRange { pos, del, len } => write!(
+                f,
+                "local change deletes {del} chars at {pos} of a {len}-char document"
+            ),
         }
     }
 }
@@ -122,7 +141,7 @@ impl std::error::Error for CollabError {
         match self {
             Self::BadMessage(e) => Some(e),
             Self::BadPeerData(e) | Self::BadSnapshot(e) | Self::Internal(e) => Some(e),
-            Self::SnapshotMissingContent | Self::NotSynced => None,
+            Self::SnapshotMissingContent | Self::NotSynced | Self::OutOfRange { .. } => None,
         }
     }
 }
@@ -236,26 +255,73 @@ impl CollabDoc {
     /// the pump rule (see module docs) to get the change to the peers.
     pub fn apply_local(&mut self, change: &Change) -> Result<(), CollabError> {
         let text = self.text.clone().ok_or(CollabError::NotSynced)?;
-        // The same running-delta walk as `Change::apply`: the edits are
-        // sorted, non-overlapping, and in pre-change coordinates, while
-        // `splice_text` sees the document mutate under it as we go.
+
+        // Validate the whole change before touching the document. `splice_text`
+        // applies one edit at a time, so an edit that fell outside the shared
+        // text partway through a multi-cursor change would leave the document
+        // half-edited *and* `projected_len` stale — and a stale length makes
+        // every later `receive_message` fail its own arithmetic check and
+        // resynchronize the whole text, forever. Rejecting the change whole
+        // keeps that from being reachable at all.
+        //
+        // The walk is the same running-delta discipline as `Change::apply`: the
+        // edits are sorted, non-overlapping, and in pre-change coordinates,
+        // while the document mutates under them as we go.
+        let mut len = self.doc.length(&text);
+        let mut delta: isize = 0;
+        for edit in change.edits() {
+            let start = edit.range.start as isize + delta;
+            let removed = edit.range.end.saturating_sub(edit.range.start);
+            if start < 0 || (start as usize).saturating_add(removed) > len {
+                return Err(CollabError::OutOfRange {
+                    pos: edit.range.start,
+                    del: removed,
+                    len,
+                });
+            }
+            let inserted = edit.text.chars().count();
+            delta += inserted as isize - removed as isize;
+            len = len - removed + inserted;
+        }
+
         let mut delta: isize = 0;
         for edit in change.edits() {
             let start = (edit.range.start as isize + delta) as usize;
-            let removed = edit.range.end - edit.range.start;
+            let removed = edit.range.end.saturating_sub(edit.range.start);
             let inserted = edit.text.chars().count();
-            self.doc
+            if let Err(e) = self
+                .doc
                 .splice_text(&text, start, removed as isize, &edit.text)
-                .map_err(CollabError::Internal)?;
+            {
+                // Validated above, so this is unreachable for a range fault —
+                // but if the document rejects a splice for any other reason it
+                // has been partially edited, and the projected length must be
+                // re-derived rather than left describing a document that no
+                // longer exists.
+                self.projected_len = self.doc.length(&text);
+                return Err(CollabError::Internal(e));
+            }
             delta += inserted as isize - removed as isize;
         }
-        self.projected_len = (self.projected_len as isize + delta) as usize;
+        self.projected_len = len;
         debug_assert_eq!(
             self.projected_len,
             self.doc.length(&text),
             "model and document disagree about the text length"
         );
         Ok(())
+    }
+
+    /// The length of the shared text in chars — what the embedder's buffer must
+    /// hold once every splice from [`receive_message`](Self::receive_message)
+    /// has been applied.
+    ///
+    /// Checking this against the model's own length after each exchange is the
+    /// cheapest possible divergence detector, and worth doing: the internal
+    /// consistency assertions are `debug_assert`s, so in a release build — which
+    /// is what ships — nothing else would ever notice two peers drifting apart.
+    pub fn len_chars(&self) -> usize {
+        self.text.as_ref().map_or(0, |text| self.doc.length(text))
     }
 
     /// The next sync message for `peer`, if the conversation is not quiescent.
@@ -534,6 +600,55 @@ mod tests {
         let empty = Change::apply(&mut Buffer::from_text("unchanged"), vec![]);
         doc.apply_local(&empty).unwrap();
         assert_eq!(doc.text(), "unchanged");
+    }
+
+    #[test]
+    fn a_change_reaching_past_the_shared_text_is_rejected_whole() {
+        // The model and the document have disagreed about the contents — an
+        // integration bug. What matters is that the document does not end up
+        // half-edited with a projected length describing a document that no
+        // longer exists: that length is what every later receive checks its own
+        // arithmetic against, so a stale one resynchronizes the whole text on
+        // every message, forever.
+        let mut doc = CollabDoc::create("abc");
+        let mut long = Buffer::from_text("abcdefgh");
+        let change = Change::apply(&mut long, vec![Edit::insert(0, "!"), Edit::delete(5..8)]);
+
+        let err = doc.apply_local(&change).unwrap_err();
+        // `len` is the length as of the failing edit — the insertion before it
+        // has already been accounted for by the running walk, exactly as it
+        // would have been had the change been applied.
+        assert!(
+            matches!(
+                err,
+                CollabError::OutOfRange {
+                    pos: 5,
+                    del: 3,
+                    len: 4
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(doc.text(), "abc", "the first edit must not have landed");
+        assert_eq!(doc.len_chars(), 3);
+
+        // And the document still works: the projected length was never spoiled.
+        let mut buffer = Buffer::from_text("abc");
+        let ok = Change::apply(&mut buffer, vec![Edit::insert(3, "d")]);
+        doc.apply_local(&ok).unwrap();
+        assert_eq!(doc.text(), "abcd");
+    }
+
+    #[test]
+    fn len_chars_tracks_the_shared_text() {
+        let mut doc = CollabDoc::create("héllo 🦀");
+        assert_eq!(doc.len_chars(), 7, "chars, not bytes");
+        assert_eq!(CollabDoc::join().len_chars(), 0);
+
+        let mut buffer = Buffer::from_text("héllo 🦀");
+        let change = Change::apply(&mut buffer, vec![Edit::delete(0..6)]);
+        doc.apply_local(&change).unwrap();
+        assert_eq!(doc.len_chars(), 1);
     }
 
     #[test]

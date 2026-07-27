@@ -55,6 +55,16 @@ impl EditorModel {
             "apply_remote with unpublished local changes: hand them to the \
              collaborative document first, or every offset in this batch is stale"
         );
+        // Receiving a collaborator's edits while not recording your own is
+        // never a coherent state: it means every local edit is silently failing
+        // to reach the shared document, and the assertion above — which is the
+        // guard against exactly that — would pass forever because the queue can
+        // never fill. Catch the miswiring instead of diverging quietly.
+        assert!(
+            self.is_recording_local_changes(),
+            "apply_remote on a model that is not recording local changes: call \
+             record_local_changes(true) when attaching the collaborative document"
+        );
 
         let lines_before = self.len_lines();
         let mut selections = self.selections().clone();
@@ -63,21 +73,44 @@ impl EditorModel {
         let mut extent: Option<(usize, usize)> = None;
 
         for splice in splices {
-            // A splice that replaces the whole buffer is the collaborative
-            // layer *resynchronizing*, not somebody's edit: same document,
-            // freshly stated. Collapsing every selection to offset 0 — what
-            // the rule below would do, since every offset is "inside the
-            // replaced span" — would be a lie about what happened, so carets
-            // hold their place, clamped into the new length.
-            let resync = splice.pos == 0 && splice.del == self.len_chars() && splice.del > 0;
+            let len_before = self.len_chars();
+            // The single point where a splice off the network becomes an edit,
+            // and so the single place it is clamped into the document. The
+            // clamped range then steers the selection rebasing too, or the two
+            // could disagree about what was replaced.
+            let edit = splice.to_edit(len_before);
+            let (pos, del) = (edit.range.start, edit.range.end - edit.range.start);
 
-            let change = self.apply_splice(splice);
+            // A splice that replaces the whole buffer is the collaborative
+            // layer *resynchronizing*, not somebody's edit: the same document,
+            // freshly stated.
+            let resync = pos == 0 && del == len_before && del > 0;
+
+            // …and a resync that restates the text we already hold is not news
+            // at all. Applying it would be a no-op on the buffer while still
+            // bumping the version, repainting everything, and — until C2b —
+            // throwing away the undo history. The collaborative layer resyncs
+            // on any patch it cannot project onto plain text, which a peer can
+            // provoke at will (a block marker on every paragraph, say), so
+            // this is the difference between "undo quietly stops working when a
+            // certain peer is in the room" and nothing happening.
+            if resync && edit.text == self.text() {
+                continue;
+            }
+
+            let inserted = edit.text.chars().count();
+            let change = self.apply_edit(edit);
+            let len_after = self.len_chars();
 
             selections = if resync {
-                let len = self.len_chars();
-                map_selections(&selections, |offset| offset.min(len))
+                // Every offset is "inside the replaced span", so the rule below
+                // would collapse the whole selection set to 0 — a lie about
+                // what happened. Carets hold their place instead, clamped.
+                map_selections(&selections, len_after, |offset| offset)
             } else {
-                map_selections(&selections, |offset| map_remote(offset, splice))
+                map_selections(&selections, len_after, |offset| {
+                    map_remote(offset, pos, del, inserted)
+                })
             };
 
             let (mut lo, mut hi) = match extent {
@@ -94,6 +127,11 @@ impl EditorModel {
             extent = Some((lo, hi));
         }
 
+        // Every splice was a restatement of what we already hold: nothing
+        // happened, and saying otherwise would repaint the document and cost
+        // the user their undo history for no reason.
+        let (lo, hi) = extent?;
+
         // A remote arrival ends the open typing run: the next character you
         // type is its own undo step, not a continuation of one recorded
         // against text that has since moved.
@@ -106,12 +144,13 @@ impl EditorModel {
         // buffer, and replaying them would corrupt it.
         self.clear_history();
 
-        let (lo, hi) = extent.expect("a non-empty batch produced no extent");
         Some(self.summarize_extent(lo, hi, EditKind::Remote, lines_before))
     }
 }
 
-/// Where an offset lands after a remote splice.
+/// Where an offset lands after a remote replacement of `del` chars at `pos` by
+/// `inserted` chars. The arguments are the *clamped* ones the edit actually
+/// used, so `pos + del` cannot overflow and no arm can underflow.
 ///
 /// Biased left throughout — this is somebody else's edit and it must not drag
 /// your caret across the screen:
@@ -121,28 +160,33 @@ impl EditorModel {
 /// - at or after the replaced span, it shifts by the splice's net length;
 /// - strictly inside the replaced span, the text it addressed is gone, so it
 ///   collapses to the *start* of what replaced it.
-fn map_remote(offset: usize, splice: &Splice) -> usize {
-    let end = splice.pos + splice.del;
-    if offset <= splice.pos {
+fn map_remote(offset: usize, pos: usize, del: usize, inserted: usize) -> usize {
+    let end = pos + del;
+    if offset <= pos {
         offset
     } else if offset >= end {
-        // offset >= pos + del, so adding (insert - del) cannot go negative.
-        (offset as isize + splice.len_delta()) as usize
+        // offset >= pos + del, so subtracting del stays at or above pos.
+        offset - del + inserted
     } else {
-        splice.pos
+        pos
     }
 }
 
-/// Rebase every selection through `map`, re-establishing the sorted,
-/// non-overlapping invariant afterwards: two carets a remote deletion collapsed
-/// onto the same offset are one caret now, and must merge or the next edit
-/// applies twice.
-fn map_selections(selections: &Selections, map: impl Fn(usize) -> usize) -> Selections {
+/// Rebase every selection through `map`, clamped into a document of `len`
+/// chars, re-establishing the sorted, non-overlapping invariant afterwards: two
+/// carets a remote deletion collapsed onto the same offset are one caret now,
+/// and must merge or the next edit applies twice.
+///
+/// The clamp is belt and braces — `map_remote` cannot leave the document for a
+/// clamped splice — but a selection that escaped the buffer would survive
+/// indefinitely and turn the *next local edit* into an out-of-range operation
+/// on the shared document, which is far from where the mistake was made.
+fn map_selections(selections: &Selections, len: usize, map: impl Fn(usize) -> usize) -> Selections {
     let items = selections
         .iter()
         .map(|sel| Selection {
-            anchor: map(sel.anchor),
-            head: map(sel.head),
+            anchor: map(sel.anchor).min(len),
+            head: map(sel.head).min(len),
             // The remembered column survives: a remote edit elsewhere in the
             // document is no reason to forget where a vertical motion run was
             // headed.
@@ -160,22 +204,30 @@ mod tests {
         Selections::single(Selection::new(anchor, head))
     }
 
+    /// Rebase through a splice the way `apply_remote` does, in a document long
+    /// enough that the clamp never fires.
+    fn rebase(selections: &Selections, splice: &Splice) -> Selections {
+        let inserted = splice.insert.chars().count();
+        map_selections(selections, usize::MAX, |offset| {
+            map_remote(offset, splice.pos, splice.del, inserted)
+        })
+    }
+
     #[test]
     fn an_insertion_at_the_caret_lands_after_it() {
-        let splice = Splice::new(5, 0, "XY");
-        assert_eq!(map_remote(5, &splice), 5, "the caret holds its place");
-        assert_eq!(map_remote(4, &splice), 4);
-        assert_eq!(map_remote(6, &splice), 8, "past it: shifted");
+        assert_eq!(map_remote(5, 5, 0, 2), 5, "the caret holds its place");
+        assert_eq!(map_remote(4, 5, 0, 2), 4);
+        assert_eq!(map_remote(6, 5, 0, 2), 8, "past it: shifted");
     }
 
     #[test]
     fn a_caret_inside_a_replaced_span_collapses_to_its_start() {
-        let splice = Splice::new(2, 4, "long replacement");
-        assert_eq!(map_remote(3, &splice), 2);
-        assert_eq!(map_remote(5, &splice), 2);
-        assert_eq!(map_remote(2, &splice), 2, "at the leading edge: unmoved");
+        // Replace 4 chars at offset 2 with 16.
+        assert_eq!(map_remote(3, 2, 4, 16), 2);
+        assert_eq!(map_remote(5, 2, 4, 16), 2);
+        assert_eq!(map_remote(2, 2, 4, 16), 2, "at the leading edge: unmoved");
         assert_eq!(
-            map_remote(6, &splice),
+            map_remote(6, 2, 4, 16),
             18,
             "at the trailing edge: after the new text"
         );
@@ -183,8 +235,7 @@ mod tests {
 
     #[test]
     fn a_deletion_swallowing_a_selection_collapses_it_to_a_caret() {
-        let splice = Splice::new(1, 8, "");
-        let mapped = map_selections(&sel(3, 6), |o| map_remote(o, &splice));
+        let mapped = rebase(&sel(3, 6), &Splice::new(1, 8, ""));
         assert_eq!(mapped.len(), 1);
         assert_eq!(*mapped.primary(), Selection::cursor(1));
     }
@@ -193,19 +244,27 @@ mod tests {
     fn selections_stay_sorted_and_merged_after_rebasing() {
         // Two carets either side of a deletion land on the same offset and
         // must become one, or the next edit is applied twice.
-        let splice = Splice::new(2, 5, "");
         let before = Selections::new(vec![Selection::cursor(2), Selection::cursor(7)], 1);
-        let after = map_selections(&before, |o| map_remote(o, &splice));
+        let after = rebase(&before, &Splice::new(2, 5, ""));
         assert_eq!(after.len(), 1);
         assert_eq!(*after.primary(), Selection::cursor(2));
     }
 
     #[test]
     fn a_reversed_selection_keeps_its_direction() {
-        let splice = Splice::new(0, 0, "ab");
-        let after = map_selections(&sel(9, 4), |o| map_remote(o, &splice));
+        let after = rebase(&sel(9, 4), &Splice::new(0, 0, "ab"));
         assert!(after.primary().is_reversed());
         assert_eq!(after.primary().anchor, 11);
         assert_eq!(after.primary().head, 6);
+    }
+
+    #[test]
+    fn rebased_selections_are_clamped_into_the_document() {
+        // A selection that escaped the buffer would survive indefinitely and
+        // turn the next *local* edit into an out-of-range operation on the
+        // shared document, a long way from where the mistake was made.
+        let after = map_selections(&sel(3, 900), 10, |offset| offset);
+        assert_eq!(after.primary().anchor, 3);
+        assert_eq!(after.primary().head, 10);
     }
 }

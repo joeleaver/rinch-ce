@@ -81,13 +81,20 @@ impl Splice {
         }
     }
 
-    /// The equivalent [`Edit`], for applying this splice as its own [`Change`].
+    /// The equivalent [`Edit`], clamped into a document of `len` chars.
     ///
-    /// Only ever *its own* change: putting two splices' edits in one [`Change`]
-    /// would apply them in shared pre-change coordinates and misplace the
-    /// second one.
-    pub fn to_edit(&self) -> Edit {
-        Edit::replace(self.pos..self.pos + self.del, self.insert.clone())
+    /// Only ever for a change of *its own*: putting two splices' edits in one
+    /// [`Change`] would apply them in shared pre-change coordinates and
+    /// misplace the second one.
+    ///
+    /// The length is not optional, because a splice generally arrives from the
+    /// network and nothing upstream of here has to be honest. `pos + del` on
+    /// unvalidated input can wrap, and an edit built from the wrapped value
+    /// corrupts the change it lands in (see [`Change::apply`]'s totality note).
+    pub fn to_edit(&self, len: usize) -> Edit {
+        let pos = self.pos.min(len);
+        let del = self.del.min(len - pos);
+        Edit::replace(pos..pos + del, self.insert.clone())
     }
 
     /// Net change in char count.
@@ -118,11 +125,36 @@ impl Change {
 
     /// Apply `edits` to `buffer` atomically and return the resulting [`Change`].
     ///
-    /// `edits` may arrive in any order; they are sorted by start offset. They must
-    /// not overlap — overlapping edits from two cursors are a caller bug, and
+    /// `edits` may arrive in any order; they are sorted by start offset — with a
+    /// *stable* sort, so two zero-width edits at the same offset keep the order
+    /// the caller gave them and their texts land in that order. They must not
+    /// overlap — overlapping edits from two cursors are a caller bug, and
     /// [`crate::Selections`] already guarantees non-overlap by construction.
+    ///
+    /// # Totality
+    ///
+    /// A malformed edit — out of range, or with `end` before `start` — is
+    /// clamped into the document rather than trusted. That is not politeness:
+    /// [`Buffer`] already clamps its own operations, so such an edit could never
+    /// panic, but the running delta below computed from the *requested* range
+    /// would then desynchronize every later edit in this change, and the
+    /// recorded `inverse` would describe a replacement that never happened.
+    /// Downstream of that, a collaborative session turns the bad arithmetic into
+    /// a negative deletion length and deletes *backwards* in the shared
+    /// document, on every peer. In release builds — which this project uses, and
+    /// where the assertion below does not exist and `usize` subtraction wraps
+    /// silently — the delta is the only thing standing between one rejected edit
+    /// and a corrupted document. So the walk takes its delta from what was
+    /// actually replaced, and for well-formed edits that is the same number.
     pub fn apply(buffer: &mut Buffer, mut edits: Vec<Edit>) -> Change {
+        // STABLE, load-bearing: two zero-width edits at the same offset sort
+        // equal, and their texts must land in the order the caller emitted
+        // them. `sort_unstable_by_key` here would silently reorder them.
         edits.sort_by_key(|e| (e.range.start, e.range.end));
+        debug_assert!(
+            edits.iter().all(|e| e.range.start <= e.range.end),
+            "inverted edit range: {edits:?}"
+        );
         debug_assert!(
             edits.windows(2).all(|w| w[0].range.end <= w[1].range.start),
             "overlapping edits in one change: {edits:?}"
@@ -135,8 +167,10 @@ impl Change {
         let mut delta: isize = 0;
 
         for edit in &edits {
-            let start = (edit.range.start as isize + delta) as usize;
-            let end = (edit.range.end as isize + delta) as usize;
+            let len = buffer.len_chars() as isize;
+            let start = (edit.range.start as isize + delta).clamp(0, len);
+            let end = (edit.range.end as isize + delta).clamp(start, len);
+            let (start, end) = (start as usize, end as usize);
 
             let removed = buffer.slice(start..end);
             if start != end {
@@ -154,7 +188,7 @@ impl Change {
                 text: removed,
             });
 
-            delta += inserted as isize - (edit.range.end - edit.range.start) as isize;
+            delta += inserted as isize - (end - start) as isize;
         }
 
         Change { edits, inverse }
@@ -309,7 +343,8 @@ mod tests {
     #[test]
     fn a_splice_is_one_atomic_replacement() {
         let mut b = Buffer::from_text("hello world");
-        Change::apply(&mut b, vec![Splice::new(6, 5, "there").to_edit()]);
+        let len = b.len_chars();
+        Change::apply(&mut b, vec![Splice::new(6, 5, "there").to_edit(len)]);
         assert_eq!(b.text(), "hello there");
         assert_eq!(Splice::new(6, 5, "there").len_delta(), 0);
         assert_eq!(Splice::new(0, 0, "🦀").len_delta(), 1, "chars, not bytes");
@@ -322,9 +357,46 @@ mod tests {
         // sequence, each addresses the document the one before it left behind.
         let mut b = Buffer::from_text("abcdef");
         for splice in [Splice::new(0, 3, "X"), Splice::new(1, 3, "Y")] {
-            Change::apply(&mut b, vec![splice.to_edit()]);
+            let len = b.len_chars();
+            Change::apply(&mut b, vec![splice.to_edit(len)]);
         }
         assert_eq!(b.text(), "XY");
+    }
+
+    #[test]
+    fn a_malformed_splice_is_clamped_rather_than_trusted() {
+        // Nothing upstream of a splice has to be honest — it comes off the
+        // network. `pos + del` must not wrap, and the edit it becomes must not
+        // address text that is not there.
+        let mut b = Buffer::from_text("abc");
+        let edit = Splice::new(2, usize::MAX, "Z").to_edit(b.len_chars());
+        assert_eq!(edit.range, 2..3);
+        Change::apply(&mut b, vec![edit]);
+        assert_eq!(b.text(), "abZ");
+
+        let edit = Splice::new(usize::MAX, 4, "!").to_edit(b.len_chars());
+        assert_eq!(edit.range, 3..3, "a position past the end lands at the end");
+        Change::apply(&mut b, vec![edit]);
+        assert_eq!(b.text(), "abZ!");
+    }
+
+    #[test]
+    fn an_out_of_range_edit_cannot_desynchronize_the_ones_after_it() {
+        // The hazard this guards: `Buffer` clamps its own operations, so a bad
+        // edit could never panic — but a running delta taken from the range it
+        // *asked* for would misplace every later edit in the same change, and a
+        // collaborative session turns that arithmetic into a backwards deletion
+        // on every peer.
+        let mut b = Buffer::from_text("abcdef");
+        let change = Change::apply(
+            &mut b,
+            vec![Edit::replace(0..99, "X"), Edit::insert(99, "Y")],
+        );
+        assert_eq!(b.text(), "XY");
+        // And the recorded inverse describes what actually happened, so undo
+        // still restores the original exactly.
+        change.undo(&mut b);
+        assert_eq!(b.text(), "abcdef");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use rinch_code_editor_buffer::{Buffer, Change, Edit, History, Selection, Selections, Splice};
+use rinch_code_editor_buffer::{Buffer, Change, Edit, History, Selection, Selections};
 use rinch_code_editor_syntax::{Highlighter, LineTokens, Theme};
 
 use crate::cursor::{self, Motion};
@@ -292,6 +292,12 @@ impl EditorModel {
         !self.local_changes.is_empty()
     }
 
+    /// Whether this model is recording local changes for a collaborative
+    /// session.
+    pub fn is_recording_local_changes(&self) -> bool {
+        self.recording
+    }
+
     /// Take everything recorded since the last call, oldest first.
     ///
     /// Hand all of it to the collaborative document, in this order, before
@@ -313,12 +319,16 @@ impl EditorModel {
         }
     }
 
-    /// Apply one remote splice as its own atomic change: buffer and
+    /// Apply one remote replacement as its own atomic change: buffer and
     /// highlighter, nothing else. No history (you cannot undo somebody else's
     /// typing), no recording (this edit came *from* the shared document), no
     /// version bump — the caller summarizes the whole batch at once.
-    pub(crate) fn apply_splice(&mut self, splice: &Splice) -> Change {
-        let change = Change::apply(&mut self.buffer, vec![splice.to_edit()]);
+    ///
+    /// `edit` must already be clamped into the document; the collaborative path
+    /// does that once, at the single point where a [`Splice`] becomes an
+    /// [`Edit`], so the clamped range can also steer the selection rebasing.
+    pub(crate) fn apply_edit(&mut self, edit: Edit) -> Change {
+        let change = Change::apply(&mut self.buffer, vec![edit]);
         self.highlighter.apply_change(&self.buffer, &change);
         change
     }
@@ -427,6 +437,11 @@ impl EditorModel {
     }
 
     /// Summarize a post-change char span `lo..hi` as the lines needing repaint.
+    ///
+    /// An empty span is reported as an empty line range at `lo` rather than as
+    /// the backwards range the fold below would otherwise produce — a change
+    /// that touched nothing needs no repaint, and `changed_lines` is documented
+    /// to be a safe over-approximation, which a reversed range is not.
     pub(crate) fn summarize_extent(
         &mut self,
         lo: usize,
@@ -437,6 +452,16 @@ impl EditorModel {
         self.version += 1;
         let lines_after = self.buffer.len_lines();
         let line_count_changed = lines_after != lines_before;
+
+        if hi < lo {
+            let line = self.buffer.position_of(hi).line;
+            return EditSummary {
+                version: self.version,
+                kind,
+                changed_lines: line..line,
+                line_count_changed,
+            };
+        }
 
         let first = self.buffer.position_of(lo).line;
         let last = if line_count_changed {

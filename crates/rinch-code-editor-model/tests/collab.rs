@@ -271,6 +271,82 @@ fn a_whole_buffer_replacement_keeps_the_caret_in_place() {
 }
 
 #[test]
+fn a_resync_that_restates_the_current_text_does_nothing_at_all() {
+    // The collaborative layer resynchronizes on any patch it cannot project
+    // onto plain text, and a peer can provoke that at will — a block marker on
+    // every paragraph, say. The text it hands back is usually identical to what
+    // we already hold, so treating it as an edit would repaint the document,
+    // bump the version and (until the history is rebased rather than dropped)
+    // cost the user their undo stack, on every keystroke that peer types.
+    let mut m = collaborating("hello world");
+    m.set_cursor(5);
+    m.insert("!");
+    m.take_local_changes();
+    let version = m.version();
+    assert!(m.can_undo());
+
+    assert!(
+        m.apply_remote(&[Splice::new(0, 12, "hello! world")])
+            .is_none(),
+        "a restatement of the current text is not an edit"
+    );
+    assert_eq!(m.version(), version, "no version bump, so no repaint");
+    assert!(m.can_undo(), "and the undo history survives");
+    assert_eq!(carets(&m), vec![6]);
+}
+
+#[test]
+fn a_resync_that_really_changes_the_text_still_applies() {
+    let mut m = collaborating("hello world");
+    m.set_cursor(5);
+    let summary = m
+        .apply_remote(&[Splice::new(0, 11, "hello there")])
+        .unwrap();
+    assert_eq!(m.text(), "hello there");
+    assert_eq!(summary.kind, EditKind::Remote);
+}
+
+#[test]
+fn a_batch_of_only_restatements_reports_nothing() {
+    let mut m = collaborating("abc");
+    let version = m.version();
+    assert!(
+        m.apply_remote(&[Splice::new(0, 3, "abc"), Splice::new(0, 3, "abc")])
+            .is_none()
+    );
+    assert_eq!(m.version(), version);
+}
+
+#[test]
+fn a_malformed_remote_splice_is_clamped_rather_than_trusted() {
+    // Splices arrive from the network. `pos + del` must not wrap, the buffer
+    // must not be addressed past its end, and no selection may escape it.
+    let mut m = collaborating("abc");
+    m.set_cursor(3);
+    m.apply_remote(&[Splice::new(2, usize::MAX, "Z")]);
+    assert_eq!(m.text(), "abZ");
+    assert!(
+        carets(&m).iter().all(|c| *c <= m.len_chars()),
+        "a caret outside the buffer would poison the next local edit"
+    );
+
+    m.apply_remote(&[Splice::new(usize::MAX, 7, "!")]);
+    assert_eq!(m.text(), "abZ!");
+    assert!(carets(&m).iter().all(|c| *c <= m.len_chars()));
+}
+
+#[test]
+#[should_panic(expected = "not recording local changes")]
+fn applying_remote_splices_without_recording_is_refused() {
+    // Receiving a collaborator's edits while not publishing your own is never
+    // coherent: every local edit is silently failing to reach the shared
+    // document, and the unpublished-changes assertion can never fire because
+    // the queue can never fill.
+    let mut m = model("hello");
+    m.apply_remote(&[Splice::new(0, 0, "oh ")]);
+}
+
+#[test]
 fn a_resync_onto_a_shorter_text_clamps_the_caret() {
     let mut m = collaborating("hello world");
     m.set_cursor(11);

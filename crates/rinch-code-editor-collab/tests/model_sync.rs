@@ -116,6 +116,15 @@ impl Net {
                 peer.doc.text(),
                 "peer {to}: the editor and its document disagree after a receive"
             );
+            // The O(1) form of the same check, and the one a real embedder
+            // should run after every exchange: the internal consistency
+            // assertions are `debug_assert`s, so in a release build nothing
+            // else would ever notice two peers drifting apart.
+            assert_eq!(
+                peer.model.len_chars(),
+                peer.doc.len_chars(),
+                "peer {to}: lengths diverged"
+            );
         }
         any
     }
