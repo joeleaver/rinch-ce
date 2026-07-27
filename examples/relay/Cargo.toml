@@ -1,0 +1,23 @@
+[package]
+name = "rinch-code-editor-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A reference y-websocket relay for the rinch code editor's collaborative layer"
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+# The collaborative layer, and *only* that. There is no rinch here at all: the
+# relay is a headless server, and the fact that it links no GUI is the clearest
+# statement there is that the collaboration crate does not depend on one.
+rinch-code-editor-collab.workspace = true
+
+# A synchronous WebSocket implementation — no async runtime, no executor. The
+# relay is a thread per connection, which at demo scale is simpler to read than
+# anything built on futures, and reading it is the point. Same version rinch's
+# own signaling server uses.
+tungstenite = "0.24"

@@ -1,0 +1,20 @@
+[package]
+name = "rinch-code-editor-net-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "One editor per process, sharing a document over a real socket through the reference relay"
+
+[[bin]]
+name = "net-demo"
+path = "src/main.rs"
+
+[dependencies]
+rinch = { workspace = true, features = ["desktop", "debug"] }
+rinch-code-editor = { workspace = true, features = ["lang-rust"] }
+rinch-code-editor-collab.workspace = true
+
+# The transport, and the reason this dependency is *here* rather than in the
+# editor or the collaboration crate: carrying the bytes is the application's job.
+tungstenite = "0.24"

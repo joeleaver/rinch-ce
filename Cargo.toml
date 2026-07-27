@@ -9,6 +9,8 @@ members = [
     "crates/rinch-code-editor-collab",
     "crates/rinch-code-editor",
     "examples/desktop-demo",
+    "examples/relay",
+    "examples/net-demo",
 ]
 # Web demos carry their own Cargo.lock and wasm-tuned [profile] blocks, and must
 # resolve wgpu/winit straight from crates.io rather than through the desktop
@@ -73,7 +75,8 @@ tree-sitter-md = "0.5"
 #
 # `sync` turns on the y-sync protocol and the awareness (presence) protocol, so
 # this crate speaks the same wire format as the Yjs ecosystem and can talk to an
-# unmodified y-websocket/Hocuspocus relay.
+# unmodified y-websocket or y-sweet relay. (Not Hocuspocus — it prefixes each
+# frame with a document name, so it is not y-sync on the wire; see doc.rs.)
 #
 # NOTE the indexing invariant CHANGED with this swap. automerge indexed Text in
 # Unicode scalars, identical to ropey's chars, so offsets crossed the boundary

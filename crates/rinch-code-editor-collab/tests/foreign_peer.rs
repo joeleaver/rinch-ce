@@ -181,8 +181,13 @@ fn garbage_bytes_are_refused_without_touching_the_document() {
     let err = doc
         .receive_message(&mut session, b"not a protocol message at all")
         .unwrap_err();
+    // Either fault is the peer's, and either recovery is "drop the connection".
+    // Which one it is depends on where the rubbish stops looking like a varint:
+    // these bytes claim a payload longer than the frame, so the decoder runs out
+    // before it produces anything and the frame comes back empty rather than
+    // malformed.
     assert!(
-        matches!(err, CollabError::BadMessage(_)),
+        matches!(err, CollabError::BadMessage(_) | CollabError::EmptyFrame),
         "untrusted bytes must be a peer fault, not a crash: {err:?}"
     );
     assert_eq!(doc.text(), "intact");
@@ -205,4 +210,74 @@ fn a_corrupt_update_payload_is_a_peer_fault() {
         "a corrupt payload must blame the peer: {err:?}"
     );
     assert_eq!(doc.text(), "hello", "and leave the document untouched");
+}
+
+/// A frame may carry several messages back to back — yrs's own
+/// `DefaultProtocol::start` packs two, and so does the Yjs client. Handling only
+/// the first would drop the rest silently, which shows up as presence
+/// occasionally not arriving rather than as anything that looks like a bug.
+#[test]
+fn several_messages_in_one_frame_are_all_handled() {
+    use rinch_code_editor_collab::{Selection, User};
+
+    let mut a = CollabDoc::create("hello world");
+    a.set_local_user(User::new("Ada", "#30bced"));
+    a.set_local_selection(Some(Selection::cursor(3)));
+    let mut b = CollabDoc::join();
+    let (mut sa, mut sb) = (SyncSession::new(), SyncSession::new());
+
+    // Everything A wants to say, concatenated into a single frame.
+    let mut packed = Vec::new();
+    while let Some(message) = a.generate_message(&mut sa) {
+        packed.extend_from_slice(&message);
+    }
+    assert!(
+        packed.len() > 2,
+        "the handshake should be more than one message"
+    );
+
+    b.receive_message(&mut sb, &packed).unwrap();
+
+    // The sync step was handled: it obliges a step 2 in reply, and a reply owed
+    // is drained ahead of B's own opening move.
+    let reply = b.generate_message(&mut sb).expect("a reply is owed");
+    assert!(
+        matches!(
+            Message::decode_v1(&reply),
+            Ok(Message::Sync(SyncMessage::SyncStep2(_)))
+        ),
+        "the sync step inside the packed frame must have been answered"
+    );
+
+    // And the awareness that came *after* it in the same frame was not dropped —
+    // the whole point of the loop.
+    assert_eq!(
+        b.peers()
+            .into_iter()
+            .map(|p| p.user.name)
+            .collect::<Vec<_>>(),
+        vec!["Ada".to_string()],
+        "the awareness message after the sync step must not be dropped"
+    );
+}
+
+/// A server refusing us must not look like silence. Swallowing the denial leaves
+/// an embedder pumping a connection that will never carry anything, with nothing
+/// to tell the user.
+#[test]
+fn an_auth_denial_is_surfaced() {
+    let mut doc = CollabDoc::create("intact");
+    let mut session = SyncSession::new();
+    let denial = Message::Auth(Some("read-only token".to_string())).encode_v1();
+
+    let err = doc.receive_message(&mut session, &denial).unwrap_err();
+    assert!(
+        matches!(&err, CollabError::Denied(reason) if reason.contains("read-only token")),
+        "a refusal must carry its reason: {err:?}"
+    );
+    assert_eq!(doc.text(), "intact");
+
+    // Permission *granted* is the absence of news, not an error.
+    let granted = Message::Auth(None).encode_v1();
+    assert!(doc.receive_message(&mut session, &granted).is_ok());
 }

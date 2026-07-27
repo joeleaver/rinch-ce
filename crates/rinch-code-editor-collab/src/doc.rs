@@ -6,8 +6,17 @@
 //! documents travels as opaque protocol bytes the embedder transports.
 //!
 //! The engine is [yrs](https://docs.rs/yrs), the Rust core of Yjs, and the wire
-//! format is the **y-sync protocol** — so a session can talk to an unmodified
-//! Yjs relay (y-websocket, Hocuspocus) and to Yjs peers, not only to us.
+//! format is the **y-sync protocol**: a varint message type then its payload,
+//! which is exactly what y-websocket puts in a binary frame. So these bytes go
+//! onto such a connection unwrapped, and a session can talk to an unmodified
+//! y-websocket or y-sweet relay, and to Yjs peers, not only to us.
+//!
+//! **Not Hocuspocus.** It prefixes every frame with a lib0 varString document
+//! name *before* the message type, so it is not y-sync on the wire and our
+//! decoder would read that length byte as a message type. Talking to it needs an
+//! adapter, and the adapter belongs in the embedder's transport rather than
+//! here: a document name is addressing, which y-sync deliberately leaves to the
+//! layer above.
 //!
 //! # The pump rule
 //!
@@ -34,21 +43,22 @@
 //! careless edit can silently corrupt, so it happens in exactly two functions
 //! and nowhere else.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rinch_code_editor_buffer::{Change, Selection, Splice};
 use ropey::Rope;
+use yrs::encoding::read::Cursor;
 use yrs::sync::time::Clock;
-use yrs::sync::{Awareness, Message, SyncMessage};
+use yrs::sync::{Awareness, Message, MessageReader, SyncMessage};
 use yrs::types::Delta;
 use yrs::types::text::TextEvent;
-use yrs::updates::decoder::Decode;
+use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Assoc, Doc, GetString, IndexedSequence, Observable, OffsetKind, Options, Origin, Out, ReadTxn,
-    StateVector, StickyIndex, Subscription, Text, TextRef, Transact, Update,
+    Assoc, ClientID, Doc, GetString, IndexedSequence, Observable, OffsetKind, Options, Origin, Out,
+    ReadTxn, StateVector, StickyIndex, Subscription, Text, TextRef, Transact, Update,
 };
 
 use crate::presence::{Peer, PortableClock, PresenceState, StickyCursor, User};
@@ -160,6 +170,17 @@ pub enum CollabError {
     /// with [`CollabDoc::join`] is read-only until the first sync delivers the
     /// content; gate editing on [`CollabDoc::is_synced`].
     NotSynced,
+    /// A frame that carried no protocol message at all — bytes that were never
+    /// this protocol, or a message truncated before its first field. Same fault
+    /// and same recovery as [`BadMessage`](Self::BadMessage); it is separate
+    /// only because the decoder reports the two conditions identically and
+    /// saying so is more honest than picking one.
+    EmptyFrame,
+    /// The other end refused us, with its reason. Blames **neither side's
+    /// code**: it is a policy answer from a server, and the only recovery is to
+    /// stop pumping this connection and tell the user. Never produced by this
+    /// crate — only received.
+    Denied(String),
     /// A local [`Change`] addressed text outside the shared document — the
     /// model and the document have disagreed about the contents. Caught
     /// *before* anything is applied, so the document is untouched and still
@@ -185,6 +206,8 @@ impl std::fmt::Display for CollabError {
             Self::BadPeerData(e) => write!(f, "peer sent an update that could not be applied: {e}"),
             Self::BadSnapshot(e) => write!(f, "snapshot failed to load: {e}"),
             Self::NotSynced => write!(f, "local edit before the first sync delivered the content"),
+            Self::EmptyFrame => write!(f, "frame carried no protocol message"),
+            Self::Denied(reason) => write!(f, "the other end refused this session: {reason}"),
             Self::OutOfRange { pos, del, len } => write!(
                 f,
                 "local change deletes {del} chars at {pos} of a {len}-char document"
@@ -199,7 +222,12 @@ impl std::error::Error for CollabError {
         match self {
             Self::BadMessage(e) | Self::BadSnapshot(e) => Some(e),
             Self::BadPeerData(e) => Some(e),
-            Self::NotSynced | Self::OutOfRange { .. } | Self::Internal(_) => None,
+            // The reason a server gave is its own words, not a nested error.
+            Self::EmptyFrame
+            | Self::Denied(_)
+            | Self::NotSynced
+            | Self::OutOfRange { .. }
+            | Self::Internal(_) => None,
         }
     }
 }
@@ -240,9 +268,17 @@ pub struct CollabDoc {
     /// session's absolute cursor still indexes correctly.
     trimmed: usize,
     /// The last cursor seen for each session, so consumed entries can be
-    /// dropped. A session that stops being pumped holds the outbox open — the
-    /// embedder should drop sessions it has finished with.
+    /// dropped. A session that stops being pumped holds the outbox open, so a
+    /// session the embedder has finished with must be handed to
+    /// [`CollabDoc::close_session`] rather than merely dropped.
     cursors: HashMap<u64, usize>,
+    /// Which peers' presence arrived on which session, so closing a session can
+    /// take their carets down with it.
+    ///
+    /// Only tracked for received awareness: our own state is not on anyone
+    /// else's connection. An entry is added when a session first carries news of
+    /// a client and removed with the session.
+    session_clients: HashMap<u64, HashSet<ClientID>>,
     /// Whether the content has arrived. A joiner is read-only until it has.
     synced: bool,
     /// Ephemeral presence — carets, names, colours — over the y-protocols
@@ -337,6 +373,7 @@ impl CollabDoc {
             outbox,
             trimmed: 0,
             cursors: HashMap::new(),
+            session_clients: HashMap::new(),
             synced,
             awareness,
             presence_version,
@@ -538,6 +575,15 @@ impl CollabDoc {
             // invisible until it happens to move — awareness is broadcast as
             // deltas, so there is nothing in the outbox to replay.
             peer.pending.push_back(encode(&Message::AwarenessQuery));
+            // …and *tell* them who we know about, without waiting to be asked.
+            // Asking alone is enough between two of these documents, because
+            // both ends ask. It is not enough against the wider ecosystem: the
+            // Yjs client announces itself and then waits, so a peer that only
+            // ever asked would stay invisible to it until somebody moved. The
+            // reference y-websocket server pushes here for the same reason.
+            if let Ok(update) = self.awareness.update() {
+                peer.pending.push_back(encode(&Message::Awareness(update)));
+            }
             let sv = self.doc.transact().state_vector();
             return Some(encode(&Message::Sync(SyncMessage::SyncStep1(sv))));
         }
@@ -564,6 +610,56 @@ impl CollabDoc {
         next
     }
 
+    /// Retire a session whose transport has gone, taking its peers' carets with
+    /// it.
+    ///
+    /// Dropping a [`SyncSession`] is not enough, and the difference only shows
+    /// up in the shape of deployment this exists for. The outbox can only be
+    /// trimmed as far as the *least* advanced session has read, so a session
+    /// that stops being pumped pins it forever: a long-lived document with
+    /// clients coming and going — a relay — grows without bound. An editor's
+    /// document lives as long as its editor and never notices.
+    ///
+    /// The presence half is the visible one. Every peer whose state arrived over
+    /// this connection is removed, which broadcasts the removal onwards, so a
+    /// collaborator whose connection died takes their caret off the other
+    /// screens at once instead of lingering until
+    /// [`expire_stale_peers`](Self::expire_stale_peers) times them out half a
+    /// minute later. That matches what y-websocket does when a socket closes.
+    ///
+    /// Pump the *remaining* sessions afterwards, or nobody hears about it.
+    ///
+    /// Takes the session by value: a closed session must not be used again, and
+    /// the protocol has no way to resume one — a reconnect starts a fresh
+    /// [`SyncSession`] at both ends.
+    pub fn close_session(&mut self, peer: SyncSession) {
+        self.cursors.remove(&peer.id);
+        let local = self.awareness.client_id();
+        for client in self.session_clients.remove(&peer.id).unwrap_or_default() {
+            // Removing ourselves would announce our own departure while we are
+            // still here — reachable if a peer ever echoes our state back.
+            if client == local {
+                continue;
+            }
+            // A connection can carry news of people who are not on it. Answering
+            // an awareness query means sending your *whole* view, so a peer that
+            // reconnects tells us about everyone it knows, and all of them get
+            // attributed to that one session. Dropping them all when it closes
+            // would take down carets belonging to people who never went
+            // anywhere. So a peer only goes when nobody else still vouches for
+            // them.
+            if self
+                .session_clients
+                .values()
+                .any(|seen| seen.contains(&client))
+            {
+                continue;
+            }
+            self.awareness.remove_state(client);
+        }
+        self.trim_outbox();
+    }
+
     /// Drop outbox entries every known session has consumed.
     fn trim_outbox(&mut self) {
         let Some(min) = self.cursors.values().copied().min() else {
@@ -580,7 +676,7 @@ impl CollabDoc {
         }
     }
 
-    /// Ingest one message from `peer`; the returned splices replay every remote
+    /// Ingest one frame from `peer`; the returned splices replay every remote
     /// edit it carried onto the model's buffer (sequentially — see [`Splice`]).
     ///
     /// Remember the pump rule: receiving usually obligates responses, to this
@@ -590,12 +686,55 @@ impl CollabDoc {
     /// [`CollabError::BadMessage`] or [`CollabError::BadPeerData`] and leaves
     /// this document untouched — the recovery is to drop the connection; it is
     /// never a panic and never a silent divergence.
+    ///
+    /// # One frame, possibly several messages
+    ///
+    /// A frame may carry more than one protocol message, back to back, and every
+    /// one of them is handled. This costs nothing between two of *our* documents
+    /// — we emit one message per frame — and it is not optional against the
+    /// wider ecosystem: yrs's own `DefaultProtocol::start` packs a sync step 1
+    /// and an awareness update into a single frame, and the Yjs client does the
+    /// same. Reading only the first message would drop the second silently, so
+    /// the failure would look like presence occasionally not arriving.
+    ///
+    /// The reader stops at the end of the buffer, and it cannot distinguish
+    /// "that was the last message" from "this message ran off the end" — both
+    /// are the same condition to it. So a frame that decodes to **no** messages
+    /// at all is rejected, which is what catches bytes that were never a
+    /// protocol message. Trailing rubbish *after* a valid message is the one
+    /// case that still passes quietly; the connection is already broken by then,
+    /// and the alternative is arithmetic on re-encoded lengths that would fail
+    /// working sessions whenever an encoder was not exactly its own inverse.
     pub fn receive_message(
         &mut self,
         peer: &mut SyncSession,
         bytes: &[u8],
     ) -> Result<Vec<Splice>, CollabError> {
-        let message = Message::decode_v1(bytes).map_err(CollabError::BadMessage)?;
+        let mut decoder = DecoderV1::new(Cursor::new(bytes));
+        let mut messages = Vec::new();
+        for message in MessageReader::new(&mut decoder) {
+            messages.push(message.map_err(CollabError::BadMessage)?);
+        }
+        if messages.is_empty() {
+            return Err(CollabError::EmptyFrame);
+        }
+
+        let mut splices = Vec::new();
+        for message in messages {
+            // Splices from successive messages simply continue the sequence:
+            // each addresses the text the ones before it produced, which is the
+            // contract `Splice` already documents.
+            splices.extend(self.handle_message(peer, message)?);
+        }
+        Ok(splices)
+    }
+
+    /// One decoded message.
+    fn handle_message(
+        &mut self,
+        peer: &mut SyncSession,
+        message: Message,
+    ) -> Result<Vec<Splice>, CollabError> {
         match message {
             Message::Sync(SyncMessage::SyncStep1(their_sv)) => {
                 // They told us what they have; owe them the difference.
@@ -622,6 +761,13 @@ impl CollabDoc {
             // document integrity, so it is swallowed rather than escalated into
             // a dropped connection.
             Message::Awareness(update) => {
+                // Remember who this connection speaks for, so closing it can
+                // take their carets down instead of leaving them until the
+                // liveness timeout notices.
+                self.session_clients
+                    .entry(peer.id)
+                    .or_default()
+                    .extend(update.clients.keys().copied());
                 let _ = self
                     .awareness
                     .apply_update_with(update, session_origin(peer.id));
@@ -636,7 +782,13 @@ impl CollabDoc {
                 }
                 Ok(Vec::new())
             }
-            Message::Auth(_) => Ok(Vec::new()),
+            // A server refusing us. Swallowing it would leave the embedder
+            // pumping a connection that will never carry anything, with nothing
+            // to show the user — the one failure mode a collaborative session
+            // cannot recover from on its own.
+            Message::Auth(Some(reason)) => Err(CollabError::Denied(reason.to_string())),
+            // Permission *granted* is the absence of news.
+            Message::Auth(None) => Ok(Vec::new()),
             Message::Custom(_, _) => Ok(Vec::new()),
         }
     }
