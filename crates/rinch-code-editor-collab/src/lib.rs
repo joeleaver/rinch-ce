@@ -26,10 +26,13 @@
 //! - [`User`] and [`Peer`] — presence in and out. Publish with
 //!   `set_local_user`/`set_local_selection`, read with `peers()`, and re-render
 //!   when `presence_version()` moves.
-//! - The pump rule, framing requirements, offset handling, and the
-//!   create/join/load session rules live in [`doc`]'s module docs; what goes
-//!   into a presence state, and why it is shaped the way Yjs shapes it, lives
-//!   in [`presence`]'s.
+//! - **The pump rule and the framing requirements** — the two things an
+//!   embedder cannot get away with not reading — are in the module docs of
+//!   `doc::session`. Offset handling and the create/join/load session rules are
+//!   in `doc`'s, which also map out where the rest of that module lives, and
+//!   what goes into a presence state — why it is shaped the way Yjs shapes it —
+//!   is in `presence`'s. Those modules are private, so read them in the source
+//!   rather than in these docs.
 //!
 //! # Driving presence
 //!
