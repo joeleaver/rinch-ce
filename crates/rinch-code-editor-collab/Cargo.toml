@@ -7,13 +7,17 @@ repository.workspace = true
 description = "Transport-agnostic collaborative editing for the rinch code editor (automerge)"
 
 [dependencies]
-# Pinned to the 0.10 line (the "automerge 3" hexane core). NO features on any
-# target: with neither `utf8-indexing` nor `utf16-indexing` enabled, automerge
-# indexes Text in Unicode scalar values — exactly ropey's char indexing, so
-# splices and patches cross the boundary with no offset conversion. A test in
-# lib.rs pins this: a transitive dependency silently enabling either feature
-# would corrupt every exchanged offset. (On wasm builds the consumer enables
-# automerge's `wasm` feature; it does not affect indexing.)
-automerge = "0.10"
+# The version pin, and more importantly the *feature* pin that keeps
+# automerge's Text indexed in Unicode scalar values, are documented in the
+# workspace manifest. The `automerge_text_indexing_is_unicode_code_points` test
+# in lib.rs is what enforces it.
+automerge.workspace = true
 
 rinch-code-editor-buffer.workspace = true
+
+[dev-dependencies]
+# Not a dependency of this crate and never will be: nothing here knows what an
+# editor is. It appears only in `model_sync.rs`, which drives two real
+# `EditorModel`s through two documents to pin the integration contract end to
+# end — the one place both halves have to be in the room together.
+rinch-code-editor-model.workspace = true

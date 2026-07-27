@@ -3060,6 +3060,7 @@ version = "0.1.0"
 dependencies = [
  "automerge",
  "rinch-code-editor-buffer",
+ "rinch-code-editor-model",
 ]
 
 [[package]]

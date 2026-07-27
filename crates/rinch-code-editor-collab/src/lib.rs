@@ -23,7 +23,13 @@
 
 mod doc;
 
-pub use doc::{CollabDoc, CollabError, Splice, SyncSession};
+pub use doc::{CollabDoc, CollabError, SyncSession};
+
+/// The unit of remote edit this crate emits, owned by the buffer crate because
+/// the editor model applies them and neither layer should have to learn the
+/// other's vocabulary. Note the *sequential* coordinate contract in its docs —
+/// it is what makes a batch of them replayable.
+pub use rinch_code_editor_buffer::Splice;
 
 /// The whole crate's offset arithmetic assumes automerge indexes `Text` in
 /// Unicode scalar values — the same units as ropey's char indexing — which is

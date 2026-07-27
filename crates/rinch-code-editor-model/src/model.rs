@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use rinch_code_editor_buffer::{Buffer, Change, Edit, History, Selection, Selections};
+use rinch_code_editor_buffer::{Buffer, Change, Edit, History, Selection, Selections, Splice};
 use rinch_code_editor_syntax::{Highlighter, LineTokens, Theme};
 
 use crate::cursor::{self, Motion};
@@ -15,6 +15,11 @@ pub enum EditKind {
     Delete,
     Undo,
     Redo,
+    /// A collaborator's edit, replayed into this document. The view must *not*
+    /// scroll the caret into view for one: the document moving under you
+    /// because somebody else is typing is not a reason to be dragged somewhere
+    /// you did not ask to go.
+    Remote,
 }
 
 /// The open undo group's shape, so the model can decide coalescing without a
@@ -58,6 +63,11 @@ pub struct EditorModel {
     /// deliberately does not bump it.
     version: u64,
     coalesce: CoalesceKind,
+    /// Local changes awaiting publication to a collaborative document, oldest
+    /// first. Empty and never appended to unless recording is on, so a
+    /// standalone editor does not accumulate a list nobody drains.
+    local_changes: Vec<Change>,
+    recording: bool,
 }
 
 impl EditorModel {
@@ -82,6 +92,8 @@ impl EditorModel {
             highlighter,
             version: 0,
             coalesce: CoalesceKind::None,
+            local_changes: Vec::new(),
+            recording: false,
         }
     }
 
@@ -226,13 +238,15 @@ impl EditorModel {
     /// Revert one undo group, restoring both the text and the selections that
     /// were active before it.
     pub fn undo(&mut self) -> Option<EditSummary> {
-        let selections = self.history.undo(&mut self.buffer)?;
+        let (selections, applied) = self.history.undo(&mut self.buffer)?;
+        self.record_all(&applied);
         Some(self.after_history(selections, EditKind::Undo))
     }
 
     /// Re-apply one undo group.
     pub fn redo(&mut self) -> Option<EditSummary> {
-        let selections = self.history.redo(&mut self.buffer)?;
+        let (selections, applied) = self.history.redo(&mut self.buffer)?;
+        self.record_all(&applied);
         Some(self.after_history(selections, EditKind::Redo))
     }
 
@@ -252,6 +266,65 @@ impl EditorModel {
             changed_lines: 0..self.buffer.len_lines(),
             line_count_changed: true,
         }
+    }
+
+    // ---- collaboration ----------------------------------------------------
+
+    /// Start (or stop) recording local text changes for a collaborative
+    /// session. Off by default.
+    ///
+    /// While on, every local mutation is queued for
+    /// [`take_local_changes`](Self::take_local_changes) — typing, deletion,
+    /// cut, paste, **and undo and redo**. Undo is on that list deliberately:
+    /// to a shared document, reverting is not a rewind but another edit, and
+    /// one that goes unpublished silently splits the session in two.
+    ///
+    /// Turning recording off discards anything still queued.
+    pub fn record_local_changes(&mut self, on: bool) {
+        self.recording = on;
+        if !on {
+            self.local_changes.clear();
+        }
+    }
+
+    /// Whether any recorded local change is still waiting to be published.
+    pub fn has_local_changes(&self) -> bool {
+        !self.local_changes.is_empty()
+    }
+
+    /// Take everything recorded since the last call, oldest first.
+    ///
+    /// Hand all of it to the collaborative document, in this order, before
+    /// applying anything that came back from the network — see
+    /// [`apply_remote`](Self::apply_remote), where the order is not optional.
+    pub fn take_local_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.local_changes)
+    }
+
+    fn record(&mut self, change: &Change) {
+        if self.recording {
+            self.local_changes.push(change.clone());
+        }
+    }
+
+    fn record_all(&mut self, changes: &[Change]) {
+        if self.recording {
+            self.local_changes.extend_from_slice(changes);
+        }
+    }
+
+    /// Apply one remote splice as its own atomic change: buffer and
+    /// highlighter, nothing else. No history (you cannot undo somebody else's
+    /// typing), no recording (this edit came *from* the shared document), no
+    /// version bump — the caller summarizes the whole batch at once.
+    pub(crate) fn apply_splice(&mut self, splice: &Splice) -> Change {
+        let change = Change::apply(&mut self.buffer, vec![splice.to_edit()]);
+        self.highlighter.apply_change(&self.buffer, &change);
+        change
+    }
+
+    pub(crate) fn clear_history(&mut self) {
+        self.history.clear();
     }
 
     // ---- the shared edit pipeline ----------------------------------------
@@ -336,14 +409,11 @@ impl EditorModel {
         self.history.push(change.clone(), before, after, coalesce);
         self.highlighter.apply_change(&self.buffer, &change);
         self.coalesce = CoalesceKind::None;
+        self.record(&change);
         self.summarize(&change, kind, lines_before)
     }
 
     fn summarize(&mut self, change: &Change, kind: EditKind, lines_before: usize) -> EditSummary {
-        self.version += 1;
-        let lines_after = self.buffer.len_lines();
-        let line_count_changed = lines_after != lines_before;
-
         // `inverse` is recorded in post-change coordinates and spans exactly the
         // newly-inserted text (an empty span at the edit point for a pure
         // deletion), so its extent is the region that needs repainting.
@@ -353,6 +423,21 @@ impl EditorModel {
             .fold((usize::MAX, 0usize), |(lo, hi), e| {
                 (lo.min(e.range.start), hi.max(e.range.end))
             });
+        self.summarize_extent(lo, hi, kind, lines_before)
+    }
+
+    /// Summarize a post-change char span `lo..hi` as the lines needing repaint.
+    pub(crate) fn summarize_extent(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        kind: EditKind,
+        lines_before: usize,
+    ) -> EditSummary {
+        self.version += 1;
+        let lines_after = self.buffer.len_lines();
+        let line_count_changed = lines_after != lines_before;
+
         let first = self.buffer.position_of(lo).line;
         let last = if line_count_changed {
             lines_after

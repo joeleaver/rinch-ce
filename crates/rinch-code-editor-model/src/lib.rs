@@ -38,6 +38,7 @@
 //! view layer's job, because that needs the visual line model the view builds.
 
 mod clipboard;
+mod collab;
 mod cursor;
 mod geometry;
 mod graphemes;
@@ -55,7 +56,7 @@ pub use select::{extend_from, line_drag, line_range_at, word_drag, word_range_at
 // the editing types from the buffer crate, and the highlighting/token/theme
 // types a renderer consumes from the syntax crate.
 pub use rinch_code_editor_buffer::{
-    Bias, Buffer, Change, Edit, History, Position, Selection, Selections,
+    Bias, Buffer, Change, Edit, History, Position, Selection, Selections, Splice,
 };
 pub use rinch_code_editor_syntax::{
     ColorId, FontStyle, Highlighter, LineTokens, PlainHighlighter, Rgba, Style, Theme,

@@ -55,6 +55,47 @@ impl Edit {
     }
 }
 
+/// Delete `del` chars at `pos`, then insert `insert` there — one contiguous
+/// replacement, in char offsets.
+///
+/// The difference from [`Edit`] is *coordinates*, and it is the whole reason
+/// this type exists. The edits inside one [`Change`] all address the document
+/// as it was **before** the change, and land together. A batch of splices is
+/// **sequential**: each addresses the document the splices before it produced,
+/// so they must be applied one at a time, in order. That is how a CRDT reports
+/// what a collaborator did, and how the collaborative layer hands remote edits
+/// to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Splice {
+    pub pos: usize,
+    pub del: usize,
+    pub insert: String,
+}
+
+impl Splice {
+    pub fn new(pos: usize, del: usize, insert: impl Into<String>) -> Self {
+        Self {
+            pos,
+            del,
+            insert: insert.into(),
+        }
+    }
+
+    /// The equivalent [`Edit`], for applying this splice as its own [`Change`].
+    ///
+    /// Only ever *its own* change: putting two splices' edits in one [`Change`]
+    /// would apply them in shared pre-change coordinates and misplace the
+    /// second one.
+    pub fn to_edit(&self) -> Edit {
+        Edit::replace(self.pos..self.pos + self.del, self.insert.clone())
+    }
+
+    /// Net change in char count.
+    pub fn len_delta(&self) -> isize {
+        self.insert.chars().count() as isize - self.del as isize
+    }
+}
+
 /// A set of edits applied as one atomic unit, together with the edits that undo it.
 ///
 /// Multi-cursor typing produces one edit per cursor, and they must land together:
@@ -120,13 +161,17 @@ impl Change {
     }
 
     /// Re-apply this change to a buffer in its pre-change state (redo).
-    pub fn redo(&self, buffer: &mut Buffer) {
-        Self::apply(buffer, self.edits.clone());
+    ///
+    /// Returns the change that was *applied*, not this one: reverting is itself
+    /// an edit, and a collaborative session has to publish it like any other.
+    pub fn redo(&self, buffer: &mut Buffer) -> Change {
+        Self::apply(buffer, self.edits.clone())
     }
 
     /// Revert this change on a buffer in its post-change state (undo).
-    pub fn undo(&self, buffer: &mut Buffer) {
-        Self::apply(buffer, self.inverse.clone());
+    /// Returns the change that was applied — see [`Change::redo`].
+    pub fn undo(&self, buffer: &mut Buffer) -> Change {
+        Self::apply(buffer, self.inverse.clone())
     }
 
     /// Rebase a pre-change offset into post-change coordinates.
@@ -259,6 +304,38 @@ mod tests {
             change.redo(&mut b);
             assert_eq!(b.text(), after);
         }
+    }
+
+    #[test]
+    fn a_splice_is_one_atomic_replacement() {
+        let mut b = Buffer::from_text("hello world");
+        Change::apply(&mut b, vec![Splice::new(6, 5, "there").to_edit()]);
+        assert_eq!(b.text(), "hello there");
+        assert_eq!(Splice::new(6, 5, "there").len_delta(), 0);
+        assert_eq!(Splice::new(0, 0, "🦀").len_delta(), 1, "chars, not bytes");
+    }
+
+    #[test]
+    fn sequential_splices_address_what_the_previous_one_produced() {
+        // The coordinate contract that separates Splice from Edit. In one
+        // Change these two would share pre-change coordinates and overlap; in
+        // sequence, each addresses the document the one before it left behind.
+        let mut b = Buffer::from_text("abcdef");
+        for splice in [Splice::new(0, 3, "X"), Splice::new(1, 3, "Y")] {
+            Change::apply(&mut b, vec![splice.to_edit()]);
+        }
+        assert_eq!(b.text(), "XY");
+    }
+
+    #[test]
+    fn undo_and_redo_return_the_change_they_applied() {
+        let mut b = Buffer::from_text("hello");
+        let change = Change::apply(&mut b, vec![Edit::insert(5, " world")]);
+        let undone = change.undo(&mut b);
+        assert_eq!(undone.edits(), [Edit::delete(5..11)]);
+        let redone = change.redo(&mut b);
+        assert_eq!(redone.edits(), [Edit::insert(5, " world")]);
+        assert_eq!(b.text(), "hello world");
     }
 
     #[test]

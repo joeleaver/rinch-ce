@@ -75,27 +75,38 @@ impl History {
         }
     }
 
-    /// Revert one group. Returns the selections to restore.
-    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<Selections> {
+    /// Revert one group. Returns the selections to restore and the changes
+    /// that were applied to the buffer, in application order — reverting is
+    /// itself an edit, and a collaborative session must publish it like any
+    /// other.
+    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(Selections, Vec<Change>)> {
         let group = self.undo_stack.pop()?;
         // Reverse order: the last change applied is the first undone.
-        for change in group.changes.iter().rev() {
-            change.undo(buffer);
-        }
+        let applied = group.changes.iter().rev().map(|c| c.undo(buffer)).collect();
         let selections = group.before.clone();
         self.redo_stack.push(group);
-        Some(selections)
+        Some((selections, applied))
     }
 
-    /// Re-apply one group. Returns the selections to restore.
-    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<Selections> {
+    /// Re-apply one group. Returns the selections to restore and the changes
+    /// that were applied — see [`History::undo`].
+    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<(Selections, Vec<Change>)> {
         let group = self.redo_stack.pop()?;
-        for change in &group.changes {
-            change.redo(buffer);
-        }
+        let applied = group.changes.iter().map(|c| c.redo(buffer)).collect();
         let selections = group.after.clone();
         self.undo_stack.push(group);
-        Some(selections)
+        Some((selections, applied))
+    }
+
+    /// Drop both stacks.
+    ///
+    /// Undo is only meaningful while the recorded edits still describe the
+    /// document in front of the user. When that stops being true — a
+    /// collaborative session resynchronizing its whole text, say — forgetting
+    /// is the honest answer; replaying stale edits would corrupt the buffer.
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
     }
 }
 
@@ -170,13 +181,76 @@ mod tests {
         h.push(change, before.clone(), sel(1), false);
 
         assert_eq!(
-            h.undo(&mut b).unwrap(),
+            h.undo(&mut b).unwrap().0,
             before,
             "undo re-selects the old text"
         );
         assert_eq!(b.text(), "hello");
-        assert_eq!(h.redo(&mut b).unwrap(), sel(1));
+        assert_eq!(h.redo(&mut b).unwrap().0, sel(1));
         assert_eq!(b.text(), "x");
+    }
+
+    #[test]
+    fn undo_and_redo_report_the_changes_they_applied() {
+        // A collaborative session republishes these, so they must describe the
+        // buffer mutation exactly — in the order it happened.
+        let mut b = Buffer::from_text("hello");
+        let mut h = History::default();
+        let before = sel(5);
+        let change = Change::apply(&mut b, vec![Edit::insert(5, " world")]);
+        h.push(change, before, sel(11), false);
+
+        let (_, applied) = h.undo(&mut b).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].edits(), [Edit::delete(5..11)]);
+        // Replaying the reported change on a fresh copy reproduces the undo.
+        let mut replay = Buffer::from_text("hello world");
+        Change::apply(&mut replay, applied[0].edits().to_vec());
+        assert_eq!(replay.text(), b.text());
+
+        let (_, applied) = h.redo(&mut b).unwrap();
+        assert_eq!(applied[0].edits(), [Edit::insert(5, " world")]);
+        Change::apply(&mut replay, applied[0].edits().to_vec());
+        assert_eq!(replay.text(), b.text());
+    }
+
+    #[test]
+    fn a_coalesced_group_reports_its_changes_in_application_order() {
+        let mut b = Buffer::new();
+        let mut h = History::default();
+        for (i, ch) in ["a", "b", "c"].iter().enumerate() {
+            type_char(&mut b, &mut h, i, ch, i > 0);
+        }
+        let (_, applied) = h.undo(&mut b).unwrap();
+        assert_eq!(b.text(), "");
+        // Three keystrokes coalesced into one group undo as three deletions,
+        // last-typed first: replaying them in this order must reproduce it.
+        let mut replay = Buffer::from_text("abc");
+        for change in &applied {
+            Change::apply(&mut replay, change.edits().to_vec());
+        }
+        assert_eq!(replay.text(), "");
+        assert_eq!(
+            applied
+                .iter()
+                .map(|c| c.edits()[0].range.clone())
+                .collect::<Vec<_>>(),
+            vec![2..3, 1..2, 0..1]
+        );
+    }
+
+    #[test]
+    fn clear_drops_both_stacks() {
+        let mut b = Buffer::new();
+        let mut h = History::default();
+        type_char(&mut b, &mut h, 0, "a", false);
+        h.undo(&mut b);
+        assert!(h.can_redo());
+        type_char(&mut b, &mut h, 0, "b", false);
+        h.clear();
+        assert!(!h.can_undo());
+        assert!(!h.can_redo());
+        assert_eq!(b.text(), "b", "clearing forgets history, not text");
     }
 
     #[test]

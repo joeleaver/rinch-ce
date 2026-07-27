@@ -27,22 +27,7 @@ use automerge::transaction::Transactable;
 use automerge::{
     AutoCommit, AutomergeError, ObjId, ObjType, PatchAction, PatchLog, ROOT, ReadDoc, Value,
 };
-use rinch_code_editor_buffer::Change;
-
-/// A single contiguous text replacement in char (Unicode scalar) offsets:
-/// delete `del` chars at `pos`, then insert `insert` there.
-///
-/// A batch of splices from [`CollabDoc::receive_message`] is **sequential**:
-/// each splice's `pos` is in the coordinates produced by the splices before
-/// it — unlike the [`Edit`](rinch_code_editor_buffer::Edit)s inside a
-/// [`Change`], which all share pre-change coordinates. Apply them in order,
-/// one at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Splice {
-    pub pos: usize,
-    pub del: usize,
-    pub insert: String,
-}
+use rinch_code_editor_buffer::{Change, Splice};
 
 /// The sync-protocol state for one remote peer.
 ///

@@ -65,8 +65,15 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-md = "0.5"
 
-# Collab
-automerge = "0.5"
+# Collab. Pinned to the 0.10 line (the "automerge 3" hexane core), with NO
+# features on any target: with neither `utf8-indexing` nor `utf16-indexing`
+# enabled, automerge indexes Text in Unicode scalar values — exactly ropey's
+# char indexing, so splices and patches cross the boundary with no offset
+# conversion. A test in the collab crate pins this: a transitive dependency
+# silently enabling either feature would corrupt every exchanged offset. (On
+# wasm builds the consumer enables automerge's `wasm` feature; it does not
+# affect indexing.)
+automerge = "0.10"
 
 thiserror = "1"
 

@@ -29,6 +29,6 @@ mod history;
 mod selection;
 
 pub use buffer::{Buffer, Position};
-pub use edit::{Bias, Change, Edit};
+pub use edit::{Bias, Change, Edit, Splice};
 pub use history::History;
 pub use selection::{Selection, Selections};
