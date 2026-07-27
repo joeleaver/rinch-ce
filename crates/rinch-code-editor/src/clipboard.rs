@@ -84,7 +84,11 @@ pub(crate) fn paste(m: &mut EditorModel) -> Option<EditSummary> {
         }
     });
     match meta {
-        Some(p) => m.paste(&text, p.is_from_empty_selection, p.multicursor_text.as_deref()),
+        Some(p) => m.paste(
+            &text,
+            p.is_from_empty_selection,
+            p.multicursor_text.as_deref(),
+        ),
         None => m.paste(&text, false, None),
     }
 }

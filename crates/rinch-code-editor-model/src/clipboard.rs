@@ -238,9 +238,8 @@ impl EditorModel {
         // The whole-line insert applies only to text that is exactly one line
         // ending in `\n` (the byte `\n` both first and last), and never when
         // distributing.
-        let mut pon = distributed.is_none()
-            && paste_on_new_line
-            && text.find('\n') == Some(text.len() - 1);
+        let mut pon =
+            distributed.is_none() && paste_on_new_line && text.find('\n') == Some(text.len() - 1);
 
         let buffer = self.buffer();
         let mut edits: Vec<Edit> = Vec::with_capacity(before.len());

@@ -251,7 +251,15 @@ fn extend_from_flips_around_a_range_and_holds_an_empty_one() {
     let sel = extend_from(&(4..7), 1);
     assert_eq!((sel.anchor, sel.head), (7, 1), "backward: anchor at end");
     let sel = extend_from(&(4..7), 4);
-    assert_eq!((sel.anchor, sel.head), (7, 4), "at the start counts as behind");
+    assert_eq!(
+        (sel.anchor, sel.head),
+        (7, 4),
+        "at the start counts as behind"
+    );
     let sel = extend_from(&(5..5), 2);
-    assert_eq!((sel.anchor, sel.head), (5, 2), "empty range anchors at itself");
+    assert_eq!(
+        (sel.anchor, sel.head),
+        (5, 2),
+        "empty range anchors at itself"
+    );
 }

@@ -94,7 +94,8 @@ pub fn word_range_at(buffer: &Buffer, offset: usize) -> Range<usize> {
     } else {
         (
             prev.map(|p| p.end).unwrap_or(0),
-            next.map(|n| n.start).unwrap_or_else(|| text.chars().count()),
+            next.map(|n| n.start)
+                .unwrap_or_else(|| text.chars().count()),
         )
     };
 
@@ -125,12 +126,11 @@ pub fn word_drag(buffer: &Buffer, initial: &Range<usize>, offset: usize) -> Sele
     // The snap candidate, Monaco's startColumn/endColumn pair: the word's
     // bounds when strictly inside one, else the exact pointer position.
     let ls = buffer.line_start(pos.line);
-    let (snap_start, snap_end) = match prev_word(&runs, c)
-        .filter(|p| p.class == Class::Word && p.start < c && c < p.end)
-    {
-        Some(p) => (ls + p.start, ls + p.end),
-        None => (offset, offset),
-    };
+    let (snap_start, snap_end) =
+        match prev_word(&runs, c).filter(|p| p.class == Class::Word && p.start < c && c < p.end) {
+            Some(p) => (ls + p.start, ls + p.end),
+            None => (offset, offset),
+        };
 
     let contains = |o: usize| initial.start <= o && o <= initial.end;
     let head = if contains(offset) {

@@ -86,7 +86,10 @@ fn copy_dedupes_empty_cursors_on_the_same_line() {
     cursors(&mut m, &[1, 3]);
     let p = m.clipboard_payload(false);
     assert_eq!(p.text, "hello\n", "the line is copied once, not twice");
-    assert_eq!(p.multicursor_text, None, "one piece, so no multicursor list");
+    assert_eq!(
+        p.multicursor_text, None,
+        "one piece, so no multicursor list"
+    );
 }
 
 #[test]
@@ -139,7 +142,10 @@ fn copy_of_a_multiline_selection_is_one_piece() {
     let mut m = model("aa\nbb\ncc");
     m.set_selections(Selections::single(Selection::new(1, 5)));
     let p = m.clipboard_payload(false);
-    assert_eq!(p.text, "a\nbb", "exactly the selected text, newline included");
+    assert_eq!(
+        p.text, "a\nbb",
+        "exactly the selected text, newline included"
+    );
     assert!(!p.is_from_empty_selection);
     assert_eq!(p.multicursor_text, None);
 }
@@ -250,7 +256,11 @@ fn cut_with_two_cursors_on_one_line_deletes_it_once() {
     cursors(&mut m, &[3, 5]); // both inside "bb"
     m.cut().unwrap();
     assert_eq!(m.text(), "aa\ncc");
-    assert_eq!(carets(&m), vec![3], "the two carets merge where the line was");
+    assert_eq!(
+        carets(&m),
+        vec![3],
+        "the two carets merge where the line was"
+    );
 }
 
 #[test]

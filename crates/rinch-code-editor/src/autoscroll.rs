@@ -67,12 +67,7 @@ pub(crate) struct AutoScroll {
 }
 
 impl AutoScroll {
-    pub(crate) fn new(
-        ctx: InputCtx,
-        mode: Rc<DragMode>,
-        origin_x: f32,
-        view_top: f32,
-    ) -> Rc<Self> {
+    pub(crate) fn new(ctx: InputCtx, mode: Rc<DragMode>, origin_x: f32, view_top: f32) -> Rc<Self> {
         Rc::new(Self {
             ctx,
             mode,
