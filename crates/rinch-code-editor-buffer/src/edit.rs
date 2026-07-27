@@ -166,8 +166,9 @@ impl Change {
         // the accumulated delta added; everything before it is already settled.
         let mut delta: isize = 0;
 
-        for edit in &edits {
+        for edit in &mut edits {
             let len = buffer.len_chars() as isize;
+            let before = delta;
             let start = (edit.range.start as isize + delta).clamp(0, len);
             let end = (edit.range.end as isize + delta).clamp(start, len);
             let (start, end) = (start as usize, end as usize);
@@ -187,6 +188,18 @@ impl Change {
                 range: start..start + inserted,
                 text: removed,
             });
+
+            // Record what was *actually* replaced, back in pre-change
+            // coordinates. For a well-formed edit this is the range it already
+            // held; for one the clamp moved, it is the difference between a
+            // `Change` that describes the buffer and one that describes a
+            // request the buffer declined. That distinction is load-bearing:
+            // `edits()` is what a collaborative session replays into the shared
+            // document, so a `Change` still advertising the original range
+            // applies locally and is *rejected* remotely — leaving the buffer
+            // edited, the document not, and nothing to put either back.
+            edit.range =
+                (start as isize - before).max(0) as usize..(end as isize - before).max(0) as usize;
 
             delta += inserted as isize - (end - start) as isize;
         }
@@ -218,7 +231,11 @@ impl Change {
         for edit in &self.edits {
             let (start, end) = (edit.range.start, edit.range.end);
             let inserted = edit.inserted_len() as isize;
-            let removed = (end - start) as isize;
+            // `saturating_sub` rather than `-`: this is a `pub` method, and an
+            // inverted range from a caller-built edit list would otherwise wrap
+            // to a vast positive number and throw every mapped offset far past
+            // the end of the document — silently, in release.
+            let removed = end.saturating_sub(start) as isize;
 
             if offset > end {
                 // Wholly after this edit: shift by its net length change.
@@ -378,6 +395,68 @@ mod tests {
         assert_eq!(edit.range, 3..3, "a position past the end lands at the end");
         Change::apply(&mut b, vec![edit]);
         assert_eq!(b.text(), "abZ!");
+    }
+
+    #[test]
+    fn a_clamped_change_reports_what_it_actually_did() {
+        // `edits()` is what a collaborative session replays into the shared
+        // document. A change still advertising a range the buffer declined
+        // applies here and is rejected there, leaving the two out of step with
+        // nothing to put either back.
+        let mut b = Buffer::from_text("hello");
+        let change = Change::apply(&mut b, vec![Edit::replace(2..99, "X")]);
+        assert_eq!(b.text(), "heX");
+        assert_eq!(
+            change.edits(),
+            [Edit::replace(2..5, "X")],
+            "the reported range is the one that was replaced"
+        );
+
+        // Replaying the reported edits onto the original text reproduces the
+        // buffer exactly — the property the collaborative document relies on.
+        let mut replay = Buffer::from_text("hello");
+        Change::apply(&mut replay, change.edits().to_vec());
+        assert_eq!(replay.text(), b.text());
+    }
+
+    #[test]
+    fn a_clamped_multi_edit_change_reports_all_of_them() {
+        let mut b = Buffer::from_text("abcdefgh");
+        let change = Change::apply(
+            &mut b,
+            vec![Edit::replace(1..99, "X"), Edit::insert(100, "Y")],
+        );
+        let mut replay = Buffer::from_text("abcdefgh");
+        Change::apply(&mut replay, change.edits().to_vec());
+        assert_eq!(
+            replay.text(),
+            b.text(),
+            "replay diverged from {:?}",
+            b.text()
+        );
+    }
+
+    // In a debug build an inverted range is caught by the assertion in `apply`,
+    // which is the right answer there. This pins what happens in the build that
+    // actually ships, where that assertion does not exist.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn map_offset_survives_an_inverted_range_from_a_caller() {
+        // `map_offset` is public and walks whatever edits the change holds; an
+        // inverted range must not wrap `end - start` into a vast positive
+        // number and fling every later offset past the end of the document.
+        let mut b = Buffer::from_text("hello");
+        // Built indirectly: a literal reversed range is a compile error under
+        // clippy, but nothing stops a caller computing one.
+        let (start, end) = (4, 1);
+        let change = Change::apply(&mut b, vec![Edit::replace(start..end, "Z")]);
+        assert_eq!(b.text(), "hellZo", "clamped to a pure insertion at 4");
+        for offset in 0..=5 {
+            assert!(
+                change.map_offset(offset, Bias::After) <= b.len_chars(),
+                "offset {offset} mapped outside the document"
+            );
+        }
     }
 
     #[test]
