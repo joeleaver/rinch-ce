@@ -123,9 +123,8 @@ impl SyncSession {
 ///   blame the **remote peer** — the bytes on the wire were malformed or
 ///   unapplicable. Network input is untrusted; the recovery is to drop that
 ///   connection, never to crash.
-/// - [`BadSnapshot`](Self::BadSnapshot) and
-///   [`SnapshotMissingContent`](Self::SnapshotMissingContent) blame the
-///   **bytes handed to [`CollabDoc::load`]** — wrong file, wrong document.
+/// - [`BadSnapshot`](Self::BadSnapshot) blames the **bytes handed to
+///   [`CollabDoc::load`]** — wrong file, wrong document.
 /// - [`NotSynced`](Self::NotSynced) blames **call ordering** — an edit before
 ///   the content exists; hold editing until [`CollabDoc::is_synced`].
 /// - [`OutOfRange`](Self::OutOfRange) and [`Internal`](Self::Internal) blame
@@ -144,9 +143,6 @@ pub enum CollabError {
     BadPeerData(yrs::error::UpdateError),
     /// The bytes handed to [`CollabDoc::load`] do not decode as a document.
     BadSnapshot(yrs::encoding::read::Error),
-    /// A snapshot decoded fine but holds no text at the content key — it is
-    /// some other document, not one of ours.
-    SnapshotMissingContent,
     /// A local edit arrived before the shared text exists. A document created
     /// with [`CollabDoc::join`] is read-only until the first sync delivers the
     /// content; gate editing on [`CollabDoc::is_synced`].
@@ -175,7 +171,6 @@ impl std::fmt::Display for CollabError {
             Self::BadMessage(e) => write!(f, "protocol message failed to decode: {e}"),
             Self::BadPeerData(e) => write!(f, "peer sent an update that could not be applied: {e}"),
             Self::BadSnapshot(e) => write!(f, "snapshot failed to load: {e}"),
-            Self::SnapshotMissingContent => write!(f, "snapshot has no text at {CONTENT:?}"),
             Self::NotSynced => write!(f, "local edit before the first sync delivered the content"),
             Self::OutOfRange { pos, del, len } => write!(
                 f,
@@ -191,10 +186,7 @@ impl std::error::Error for CollabError {
         match self {
             Self::BadMessage(e) | Self::BadSnapshot(e) => Some(e),
             Self::BadPeerData(e) => Some(e),
-            Self::SnapshotMissingContent
-            | Self::NotSynced
-            | Self::OutOfRange { .. }
-            | Self::Internal(_) => None,
+            Self::NotSynced | Self::OutOfRange { .. } | Self::Internal(_) => None,
         }
     }
 }
@@ -336,6 +328,25 @@ impl CollabDoc {
     }
 
     /// Join from a snapshot previously produced by [`CollabDoc::save`].
+    ///
+    /// Bytes that do not decode are refused ([`CollabError::BadSnapshot`]).
+    /// Bytes that *do* decode are accepted, whatever they contain — this
+    /// deliberately does not try to verify that the snapshot is "one of ours",
+    /// because in yrs that question has no answer:
+    ///
+    /// - Root types are implicit and untyped on the wire. A root that arrives
+    ///   in an update reports `TypeRef::Undefined` whether it was a text or a
+    ///   map at the source, and `get_text` **coerces** rather than discriminates
+    ///   — its `None` means only "no root by that name", never "wrong type".
+    /// - An *empty* document carries no root type at all. So a legitimate empty
+    ///   snapshot from [`save`](Self::save) and a foreign document with no
+    ///   content key are byte-for-byte indistinguishable by that test.
+    ///
+    /// A guard here would therefore reject every empty document to catch
+    /// nothing — which is exactly what the previous one did. Yjs itself has no
+    /// such concept (`Y.applyUpdate` accepts any update, root types spring into
+    /// existence on demand), and identifying a file as yours belongs to the
+    /// container format around the snapshot, not to the snapshot.
     pub fn load(bytes: &[u8]) -> Result<Self, CollabError> {
         let update = Update::decode_v1(bytes).map_err(CollabError::BadSnapshot)?;
         let doc = Self::new_doc();
@@ -343,9 +354,6 @@ impl CollabDoc {
             let mut txn = doc.transact_mut();
             txn.apply_update(update)
                 .map_err(|e| CollabError::Internal(e.to_string()))?;
-        }
-        if doc.transact().get_text(CONTENT).is_none() {
-            return Err(CollabError::SnapshotMissingContent);
         }
         Ok(Self::build(doc, true))
     }
@@ -652,6 +660,23 @@ impl CollabDoc {
             vec![Splice::new(0, old_len, truth)]
         }
     }
+
+    /// Assert the mirror still holds exactly what the document holds.
+    ///
+    /// The same invariant the `debug_assert_eq!`s above state — but those are
+    /// compiled out of release builds, and this project builds and *tests*
+    /// exclusively in release, so on its own that check never runs anywhere.
+    /// This is the version the unit tests call explicitly, so the crate's
+    /// load-bearing invariant is actually verified in the configuration we ship
+    /// and test. It is O(document); that is why it is not on the edit path.
+    #[cfg(test)]
+    fn assert_mirror_intact(&self) {
+        assert_eq!(
+            self.mirror.to_string(),
+            self.text.get_string(&self.doc.transact()),
+            "the mirror and the document disagree"
+        );
+    }
 }
 
 fn encode(message: &Message) -> Vec<u8> {
@@ -671,4 +696,76 @@ fn session_origin(id: u64) -> Origin {
 /// Recover the session id a transaction was tagged with, if any.
 fn origin_session(origin: &Origin) -> Option<u64> {
     std::str::from_utf8(origin.as_ref()).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rinch_code_editor_buffer::{Buffer, Edit};
+
+    /// An empty document is a document. It round-trips, it is synced, and it is
+    /// editable afterwards.
+    ///
+    /// This is a regression pin, not a formality: yrs encodes an empty document
+    /// as an update carrying **no root type at all** (two bytes), so `load`
+    /// used to look for the content key, not find it, and refuse the snapshot
+    /// with `SnapshotMissingContent` — meaning saving and reopening an empty
+    /// file was an error. See [`CollabDoc::load`] for why no check can tell an
+    /// empty document from a foreign one.
+    #[test]
+    fn an_empty_snapshot_round_trips_and_is_editable() {
+        let mut doc = CollabDoc::create("");
+        let bytes = doc.save();
+        let mut loaded = CollabDoc::load(&bytes).expect("an empty document is still a document");
+        assert_eq!(loaded.text(), "");
+        assert_eq!(loaded.len_chars(), 0);
+        assert!(loaded.is_synced());
+
+        let mut buffer = Buffer::from_text("");
+        let change = Change::apply(&mut buffer, vec![Edit::insert(0, "typed after reopening")]);
+        loaded.apply_local(&change).unwrap();
+        assert_eq!(loaded.text(), "typed after reopening");
+        loaded.assert_mirror_intact();
+    }
+
+    #[test]
+    fn garbage_bytes_are_refused_by_load() {
+        for bytes in [&b"not a yrs document"[..], &b""[..], &[0xffu8; 8][..]] {
+            assert!(
+                matches!(CollabDoc::load(bytes), Err(CollabError::BadSnapshot(_))),
+                "expected a decode failure from {bytes:?}"
+            );
+        }
+    }
+
+    /// A document that is not ours loads as an empty one, deliberately.
+    ///
+    /// yrs cannot distinguish it: root types are untyped on the wire (a root
+    /// arriving in an update reports `TypeRef::Undefined` whether it was a text
+    /// or a map at the source), and `get_text` coerces rather than
+    /// discriminates. This test exists so that the next person to notice the
+    /// missing check finds the reasoning attached to the behaviour instead of
+    /// reinstating a guard that rejects empty documents to catch nothing.
+    #[test]
+    fn a_foreign_document_loads_as_empty_because_yrs_cannot_tell() {
+        use yrs::{Any, Map};
+
+        let foreign = Doc::new();
+        let map = foreign.get_or_insert_map(CONTENT);
+        {
+            let mut txn = foreign.transact_mut();
+            map.insert(&mut txn, "k", Any::from("a map, not a text"));
+        }
+        let bytes = foreign
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+
+        let loaded = CollabDoc::load(&bytes).expect("it decodes, so it loads");
+        assert_eq!(
+            loaded.text(),
+            "",
+            "the map is invisible to a text projection"
+        );
+        loaded.assert_mirror_intact();
+    }
 }
