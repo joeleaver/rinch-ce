@@ -1,9 +1,9 @@
 //! The collaborative surface of the model, driven through its public API:
 //! recording local changes for publication, and replaying a collaborator's.
 //!
-//! End-to-end convergence against a real automerge document lives in the
-//! collab crate's `model_sync.rs`; this file pins the model's own behaviour,
-//! including the parts an automerge document would never think to produce.
+//! End-to-end convergence against a real CRDT document lives in the collab
+//! crate's `model_sync.rs`; this file pins the model's own behaviour, including
+//! the parts a well-behaved document would never think to produce.
 
 use rinch_code_editor_model::{
     EditKind, EditorModel, Highlighter, Selection, Selections, Splice, Theme,

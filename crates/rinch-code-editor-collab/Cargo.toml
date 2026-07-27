@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Transport-agnostic collaborative editing for the rinch code editor (automerge)"
+description = "Transport-agnostic collaborative editing for the rinch code editor (yrs / y-sync)"
 
 [dependencies]
 # The engine. The version pin, the `sync` feature, and the offset-encoding

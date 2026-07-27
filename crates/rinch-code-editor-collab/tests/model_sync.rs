@@ -297,9 +297,11 @@ fn a_coalesced_typing_run_survives_the_round_trip() {
 }
 
 #[test]
-fn unicode_offsets_cross_the_boundary_unconverted() {
-    // The crate's load-bearing invariant: automerge indexes Text in Unicode
-    // scalar values, exactly like ropey's chars, so nothing converts.
+fn unicode_offsets_survive_the_boundary_conversion() {
+    // The crate's load-bearing invariant, end to end: the model speaks chars,
+    // yrs indexes UTF-16 code units, and the conversion between them is exact.
+    // Inserting *after* an astral char is where an unconverted offset lands in
+    // the wrong place — or inside a surrogate pair.
     let mut net = Net::pair("héllo 🦀 wörld");
     net.model(0).set_cursor(6);
     net.model(0).insert("🎉");
