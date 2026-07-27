@@ -1,33 +1,80 @@
 //! The collaborative document and its per-peer sync sessions.
 //!
-//! [`CollabDoc`] is an automerge mirror of the editor's buffer: local edits
-//! flow in as [`Change`]s ([`CollabDoc::apply_local`]), remote edits flow out
-//! as [`Splice`]s ([`CollabDoc::receive_message`]), and everything between two
-//! documents travels as opaque sync-protocol bytes the embedder transports.
+//! [`CollabDoc`] is a CRDT mirror of the editor's buffer: local edits flow in as
+//! [`Change`]s ([`CollabDoc::apply_local`]), remote edits flow out as
+//! [`Splice`]s ([`CollabDoc::receive_message`]), and everything between two
+//! documents travels as opaque protocol bytes the embedder transports.
+//!
+//! The engine is [yrs](https://docs.rs/yrs), the Rust core of Yjs, and the wire
+//! format is the **y-sync protocol** — so a session can talk to an unmodified
+//! Yjs relay (y-websocket, Hocuspocus) and to Yjs peers, not only to us.
 //!
 //! # The pump rule
 //!
-//! The sync protocol is a per-peer conversation. After **any** local change and
-//! after **any** received message, call [`CollabDoc::generate_message`] for
-//! **every** peer, delivering what comes out, until a full round over all peers
-//! returns `None` — that is quiescence. Changes are content-addressed, so a
-//! change reaching a peer twice (say, relayed through two different peers)
-//! converges harmlessly.
+//! The protocol is a per-peer conversation. After **any** local change and after
+//! **any** received message, call [`CollabDoc::generate_message`] for **every**
+//! peer, delivering what comes out, until a full round over all peers returns
+//! `None` — that is quiescence. Updates are idempotent, so one reaching a peer
+//! twice (say, relayed through two different peers) converges harmlessly.
 //!
 //! # Framing
 //!
-//! A sync message is a length-delimited unit, not a stream: the transport must
+//! A message is a length-delimited unit, not a stream: the transport must
 //! preserve message boundaries. WebSocket binary frames give this for free; a
 //! raw TCP stream needs a length prefix. Each peer's messages must arrive
 //! reliably and in order — after a transport reconnect, start a fresh
 //! [`SyncSession`] (both sides), never resume the old one.
+//!
+//! # Offsets
+//!
+//! Everything this crate exposes is in **chars** (Unicode scalars), matching
+//! [`Buffer`](rinch_code_editor_buffer::Buffer) and ropey. yrs indexes its text
+//! in **UTF-16 code units**, so this module converts at its boundary — see
+//! [`CollabDoc::mirror`]. That conversion is the one thing in here that a
+//! careless edit can silently corrupt, so it happens in exactly two functions
+//! and nowhere else.
 
-use automerge::sync::{self, SyncDoc};
-use automerge::transaction::Transactable;
-use automerge::{
-    AutoCommit, AutomergeError, ObjId, ObjType, PatchAction, PatchLog, ROOT, ReadDoc, Value,
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use rinch_code_editor_buffer::{Change, Splice};
+use ropey::Rope;
+use yrs::sync::{Message, SyncMessage};
+use yrs::types::Delta;
+use yrs::types::text::TextEvent;
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
+use yrs::{
+    Doc, GetString, Observable, OffsetKind, Options, Origin, Out, ReadTxn, StateVector,
+    Subscription, Text, TextRef, Transact, Update,
+};
+
+/// The key the shared text lives under. Root types in yrs are implicit and
+/// keyed by name, so two peers naming the same key get the *same* object with no
+/// coordination — unlike a CRDT where the container itself is an operation,
+/// there is no "both sides created it" hazard to repair.
+const CONTENT: &str = "content";
+
+/// An update this document produced, tagged with the session it arrived on so
+/// it is never echoed back down that connection.
+type Outgoing = (Option<u64>, Vec<u8>);
+/// The shared outbox. `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` only because
+/// yrs requires observer closures to be `Send + Sync`; it is never contended.
+type Outbox = Arc<Mutex<Vec<Outgoing>>>;
+
+/// One recognized step of a remote edit, in yrs's UTF-16 units, captured while
+/// an update is being applied. Converted to [`Splice`]s (chars) immediately
+/// afterwards; see [`CollabDoc::drain_steps`].
+enum Step {
+    Retain(u32),
+    Insert(String),
+    Delete(u32),
+    /// A change to the text this plain-text projection cannot represent — an
+    /// embedded value, or formatting attributes. Triggers a resync rather than
+    /// a guess.
+    Unrepresentable,
+}
 
 /// The sync-protocol state for one remote peer.
 ///
@@ -35,14 +82,35 @@ use rinch_code_editor_buffer::{Change, Splice};
 /// session assumes a reliable in-order byte stream underneath; when the
 /// transport drops, throw the session away and start a new one on reconnect —
 /// the protocol re-negotiates what the peer is missing from scratch.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SyncSession {
-    state: sync::State,
+    /// Identifies this connection, so an update that arrived on it is never
+    /// sent straight back out of it.
+    id: u64,
+    /// Whether our opening state vector has gone out.
+    opened: bool,
+    /// A reply owed to this peer, produced while handling its last message.
+    /// Handed over by the next [`CollabDoc::generate_message`].
+    pending: Option<Vec<u8>>,
+    /// How far this peer has been caught up through the document's outbox.
+    cursor: usize,
+}
+
+impl Default for SyncSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SyncSession {
     pub fn new() -> Self {
-        Self::default()
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            opened: false,
+            pending: None,
+            cursor: 0,
+        }
     }
 }
 
@@ -54,59 +122,40 @@ impl SyncSession {
 /// - [`BadMessage`](Self::BadMessage) and [`BadPeerData`](Self::BadPeerData)
 ///   blame the **remote peer** — the bytes on the wire were malformed or
 ///   unapplicable. Network input is untrusted; the recovery is to drop that
-///   connection, never to crash. A sync message's envelope is validated up
-///   front (`BadMessage`), but its change payload is opaque until applied, so a
-///   corrupt or conflicting change surfaces later as `BadPeerData` — same
-///   fault, same recovery, just a different point of detection.
+///   connection, never to crash.
 /// - [`BadSnapshot`](Self::BadSnapshot) and
 ///   [`SnapshotMissingContent`](Self::SnapshotMissingContent) blame the
 ///   **bytes handed to [`CollabDoc::load`]** — wrong file, wrong document.
 /// - [`NotSynced`](Self::NotSynced) blames **call ordering** — an edit before
 ///   the content exists; hold editing until [`CollabDoc::is_synced`].
-/// - [`Internal`](Self::Internal) blames **this integration** — the model and
-///   the document disagree about the text (an out-of-range local splice). It is
-///   reachable only from [`CollabDoc::apply_local`], never from network input,
-///   and it *is* a bug: fail fast.
+/// - [`OutOfRange`](Self::OutOfRange) and [`Internal`](Self::Internal) blame
+///   **this integration** — the model and the document disagree about the text.
+///   Never reachable from network input, and a bug: fail fast.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CollabError {
     /// The bytes handed to [`CollabDoc::receive_message`] do not decode as a
-    /// sync message — the envelope itself is malformed. Untrusted input; drop
-    /// the connection, do not crash.
-    BadMessage(sync::ReadMessageError),
-    /// A sync message decoded, but applying the change payload it carried
-    /// failed — a corrupt change chunk, or a `(actor, seq)` a hostile or buggy
-    /// peer already used. `sync::Message::decode` validates only the envelope;
-    /// the changes are opaque byte blobs until applied, so this is where bad
-    /// *payload* (as opposed to a bad envelope) is caught. Same fault as
-    /// [`BadMessage`](Self::BadMessage) — untrusted input — so the recovery is
-    /// the same: drop the connection, do not crash. The document is left
-    /// untouched (the failing change is rejected before it lands), so the peer
-    /// may reconnect with a fresh [`SyncSession`].
-    BadPeerData(AutomergeError),
-    /// The bytes handed to [`CollabDoc::load`] do not decode as an automerge
-    /// document.
-    BadSnapshot(AutomergeError),
-    /// A snapshot decoded fine but holds no `Text` at `ROOT["content"]` — it
-    /// is some other automerge document, not one of ours.
+    /// protocol message. Untrusted input; drop the connection, do not crash.
+    BadMessage(yrs::encoding::read::Error),
+    /// A message decoded, but the update it carried could not be applied — a
+    /// corrupt payload from a hostile or buggy peer. Same fault as
+    /// [`BadMessage`](Self::BadMessage), same recovery. The document is left
+    /// untouched, so the peer may reconnect with a fresh [`SyncSession`].
+    BadPeerData(yrs::error::UpdateError),
+    /// The bytes handed to [`CollabDoc::load`] do not decode as a document.
+    BadSnapshot(yrs::encoding::read::Error),
+    /// A snapshot decoded fine but holds no text at the content key — it is
+    /// some other document, not one of ours.
     SnapshotMissingContent,
     /// A local edit arrived before the shared text exists. A document created
     /// with [`CollabDoc::join`] is read-only until the first sync delivers the
-    /// content; the embedder should hold editing until [`CollabDoc::is_synced`]
-    /// returns `true`.
+    /// content; gate editing on [`CollabDoc::is_synced`].
     NotSynced,
-    /// A local splice from [`CollabDoc::apply_local`] fell outside the shared
-    /// text — the model and the document have disagreed about its contents.
-    /// This is an integration bug, not a recoverable condition, and (unlike the
-    /// peer-fault variants) is never reachable from network input.
-    Internal(AutomergeError),
-    /// A local [`Change`] addressed text outside the shared document. Like
-    /// [`Internal`](Self::Internal) this means the model and the document have
-    /// disagreed about the contents, and it is a bug rather than something to
-    /// recover from — but it is caught *before* anything is applied, so the
-    /// document is untouched and still describes itself honestly. The embedder
-    /// should resynchronize the model from [`CollabDoc::text`] rather than
-    /// carry on.
+    /// A local [`Change`] addressed text outside the shared document — the
+    /// model and the document have disagreed about the contents. Caught
+    /// *before* anything is applied, so the document is untouched and still
+    /// describes itself honestly; resynchronize the model from
+    /// [`CollabDoc::text`] rather than carrying on.
     OutOfRange {
         /// The offending edit's start, in pre-change coordinates.
         pos: usize,
@@ -115,23 +164,24 @@ pub enum CollabError {
         /// The length of the shared text the change was validated against.
         len: usize,
     },
+    /// An operation the engine rejected for a reason that is not the peer's
+    /// fault and not a range fault. An integration bug.
+    Internal(String),
 }
 
 impl std::fmt::Display for CollabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadMessage(e) => write!(f, "sync message envelope failed to decode: {e}"),
-            Self::BadPeerData(e) => write!(f, "peer sent a change that could not be applied: {e}"),
+            Self::BadMessage(e) => write!(f, "protocol message failed to decode: {e}"),
+            Self::BadPeerData(e) => write!(f, "peer sent an update that could not be applied: {e}"),
             Self::BadSnapshot(e) => write!(f, "snapshot failed to load: {e}"),
-            Self::SnapshotMissingContent => {
-                write!(f, "snapshot has no Text at ROOT[\"content\"]")
-            }
+            Self::SnapshotMissingContent => write!(f, "snapshot has no text at {CONTENT:?}"),
             Self::NotSynced => write!(f, "local edit before the first sync delivered the content"),
-            Self::Internal(e) => write!(f, "internal automerge operation failed: {e}"),
             Self::OutOfRange { pos, del, len } => write!(
                 f,
                 "local change deletes {del} chars at {pos} of a {len}-char document"
             ),
+            Self::Internal(e) => write!(f, "internal engine operation failed: {e}"),
         }
     }
 }
@@ -139,113 +189,199 @@ impl std::fmt::Display for CollabError {
 impl std::error::Error for CollabError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::BadMessage(e) => Some(e),
-            Self::BadPeerData(e) | Self::BadSnapshot(e) | Self::Internal(e) => Some(e),
-            Self::SnapshotMissingContent | Self::NotSynced | Self::OutOfRange { .. } => None,
+            Self::BadMessage(e) | Self::BadSnapshot(e) => Some(e),
+            Self::BadPeerData(e) => Some(e),
+            Self::SnapshotMissingContent
+            | Self::NotSynced
+            | Self::OutOfRange { .. }
+            | Self::Internal(_) => None,
         }
     }
 }
 
-/// An automerge document mirroring one editor buffer, as a `Text` object at
-/// `ROOT["content"]`.
-///
-/// # Create, join, or load — never create twice
-///
-/// Exactly **one** peer per session calls [`CollabDoc::create`]; everyone else
-/// calls [`CollabDoc::join`] (content arrives via sync) or [`CollabDoc::load`]
-/// (content arrives as a snapshot). If two peers each `create`, they make two
-/// *different* `Text` objects for the same key; the merge deterministically
-/// keeps one and shadows the other, silently discarding the loser's edits.
-/// `receive_message` detects the shadowed side and repairs it with a full
-/// replace, but the discarded text is gone — this is a misuse to avoid, not a
-/// mode to rely on.
-#[derive(Debug)]
+/// A CRDT document mirroring one editor buffer, as a text at the content key.
 pub struct CollabDoc {
-    doc: AutoCommit,
-    /// The `Text` at `ROOT["content"]`, or `None` on a joined document that
-    /// has not yet received it. Re-resolved after every receive: a change in
-    /// the winning object's identity (the join bootstrap, or the misuse-only
-    /// create/create conflict) is one of the triggers for a full-replace
-    /// resync.
-    text: Option<ObjId>,
-    /// Chars the embedder's model currently mirrors — the length of the text
-    /// as of the last splice batch we emitted (or local change we applied). A
-    /// full-replace resync must delete exactly this many chars, which the
-    /// post-receive document length can no longer tell us.
-    projected_len: usize,
+    doc: Doc,
+    text: TextRef,
+    /// A rope holding exactly what the shared text holds.
+    ///
+    /// It earns its keep three times over. It is the only way to convert
+    /// between the char offsets this crate exposes and the UTF-16 units yrs
+    /// indexes by — exactly, and in O(log n). It makes [`text`](Self::text) and
+    /// [`len_chars`](Self::len_chars) cheap. And comparing it against the
+    /// document is the divergence detector, which matters because the engine's
+    /// own consistency checks are `debug_assert`s and this project ships
+    /// release builds.
+    mirror: Rope,
+    /// Where the text observer deposits steps, and the flag that gates it.
+    /// A mutex rather than a `RefCell` only because yrs requires observer
+    /// closures to be `Send + Sync`; it is never contended, since the observer
+    /// runs inline on the thread applying the update.
+    ///
+    /// `Some` only while a *remote* update is being applied, because the
+    /// observer fires for local edits too and echoing those back to the model
+    /// would apply every keystroke twice.
+    steps: Arc<Mutex<Option<Vec<Step>>>>,
+    /// Every update this document has produced, oldest first, each tagged with
+    /// the session it arrived on (so it is not echoed back there).
+    ///
+    /// yrs is *push*-based and this is why: a state vector cannot tell you
+    /// whether a peer is missing anything, because a **deletion advances no
+    /// clock** — deletes live in a separate delete-set. Comparing state vectors
+    /// to decide what to send therefore propagates inserts and silently drops
+    /// every deletion, which is exactly the bug this replaced.
+    outbox: Outbox,
+    /// How many entries have been dropped off the front of `outbox`, so a
+    /// session's absolute cursor still indexes correctly.
+    trimmed: usize,
+    /// The last cursor seen for each session, so consumed entries can be
+    /// dropped. A session that stops being pumped holds the outbox open — the
+    /// embedder should drop sessions it has finished with.
+    cursors: HashMap<u64, usize>,
+    /// Whether the content has arrived. A joiner is read-only until it has.
+    synced: bool,
+    _sub: Subscription,
+    _updates: Subscription,
+}
+
+impl std::fmt::Debug for CollabDoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollabDoc")
+            .field("len_chars", &self.mirror.len_chars())
+            .field("synced", &self.synced)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CollabDoc {
-    /// Start a session as its originator, seeding the shared text.
-    pub fn create(initial: &str) -> Self {
-        let mut doc = AutoCommit::new();
-        let text = doc
-            .put_object(ROOT, "content", ObjType::Text)
-            .expect("put_object at ROOT cannot fail");
-        doc.splice_text(&text, 0, 0, initial)
-            .expect("splice into a fresh Text cannot fail");
+    fn build(doc: Doc, synced: bool) -> Self {
+        let text = doc.get_or_insert_text(CONTENT);
+        let steps: Arc<Mutex<Option<Vec<Step>>>> = Arc::new(Mutex::new(None));
+        let sink = steps.clone();
+        let sub = text.observe(move |txn, e: &TextEvent| {
+            let Ok(mut slot) = sink.lock() else { return };
+            let Some(out) = slot.as_mut() else {
+                return; // a local edit; the model already has it
+            };
+            for delta in e.delta(txn) {
+                out.push(match delta {
+                    Delta::Retain(n, attrs) if attrs.is_none() => Step::Retain(*n),
+                    Delta::Deleted(n) => Step::Delete(*n),
+                    Delta::Inserted(Out::Any(yrs::Any::String(s)), attrs) if attrs.is_none() => {
+                        Step::Insert(s.to_string())
+                    }
+                    // Formatting attributes on a range we render as plain text.
+                    _ => Step::Unrepresentable,
+                });
+            }
+        });
+        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let sink = outbox.clone();
+        let updates = doc
+            .observe_update_v1(move |txn, e| {
+                let from = txn.origin().and_then(origin_session);
+                if let Ok(mut out) = sink.lock() {
+                    out.push((from, e.update.clone()));
+                }
+            })
+            .expect("a fresh document accepts an update observer");
+        let mirror = Rope::from_str(&text.get_string(&doc.transact()));
         Self {
             doc,
-            text: Some(text),
-            projected_len: initial.chars().count(),
+            text,
+            mirror,
+            steps,
+            outbox,
+            trimmed: 0,
+            cursors: HashMap::new(),
+            synced,
+            _sub: sub,
+            _updates: updates,
         }
+    }
+
+    fn new_doc() -> Doc {
+        // The invariant this crate is built on. yrs offers UTF-8 bytes or
+        // UTF-16 code units; UTF-16 is what Yjs itself uses, so it is the
+        // choice that keeps us wire-compatible with the Yjs ecosystem. Two
+        // peers configured differently still *converge* — the CRDT is
+        // identity-based — but they would disagree about what an index means,
+        // so this is a contract, not a local preference.
+        let options = Options {
+            offset_kind: OffsetKind::Utf16,
+            ..Options::default()
+        };
+        Doc::with_options(options)
+    }
+
+    /// Start a session as its originator, seeding the shared text.
+    pub fn create(initial: &str) -> Self {
+        let mut this = Self::build(Self::new_doc(), true);
+        if !initial.is_empty() {
+            {
+                let mut txn = this.doc.transact_mut();
+                this.text.insert(&mut txn, 0, initial);
+            }
+            this.mirror = Rope::from_str(initial);
+        }
+        this
     }
 
     /// Join a session someone else created. The document is empty — and
     /// read-only, see [`CollabError::NotSynced`] — until the first sync
     /// delivers the content, at which point [`is_synced`](Self::is_synced)
-    /// flips to `true` and [`receive_message`](Self::receive_message) emits one
-    /// full-length [`Splice`] (an *empty* shared document emits none, so gate
-    /// editing on `is_synced`, not on seeing that splice).
+    /// flips to `true`.
     pub fn join() -> Self {
-        Self {
-            doc: AutoCommit::new(),
-            text: None,
-            projected_len: 0,
-        }
+        Self::build(Self::new_doc(), false)
     }
 
     /// Join from a snapshot previously produced by [`CollabDoc::save`].
     pub fn load(bytes: &[u8]) -> Result<Self, CollabError> {
-        let doc = AutoCommit::load(bytes).map_err(CollabError::BadSnapshot)?;
-        let text = content_text(&doc).ok_or(CollabError::SnapshotMissingContent)?;
-        let projected_len = doc.length(&text);
-        Ok(Self {
-            doc,
-            text: Some(text),
-            projected_len,
-        })
+        let update = Update::decode_v1(bytes).map_err(CollabError::BadSnapshot)?;
+        let doc = Self::new_doc();
+        {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update)
+                .map_err(|e| CollabError::Internal(e.to_string()))?;
+        }
+        if doc.transact().get_text(CONTENT).is_none() {
+            return Err(CollabError::SnapshotMissingContent);
+        }
+        Ok(Self::build(doc, true))
     }
 
-    /// A compacted snapshot of the whole document, for [`CollabDoc::load`].
+    /// A snapshot of the whole document, for [`CollabDoc::load`].
     pub fn save(&mut self) -> Vec<u8> {
-        self.doc.save()
+        self.doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default())
     }
 
     /// The current shared text. Empty on a joined document before first sync.
     pub fn text(&self) -> String {
-        match &self.text {
-            Some(text) => self
-                .doc
-                .text(text)
-                .expect("content Text is a live object in this doc"),
-            None => String::new(),
-        }
+        self.mirror.to_string()
     }
 
-    /// Whether the shared text exists yet — equivalently, whether
+    /// The length of the shared text in chars — what the embedder's buffer must
+    /// hold once every splice has been applied. Checking this against the
+    /// model's own length after each exchange is the cheapest divergence
+    /// detector there is, and worth doing.
+    pub fn len_chars(&self) -> usize {
+        self.mirror.len_chars()
+    }
+
+    /// Whether the shared text has arrived yet — equivalently, whether
     /// [`apply_local`](Self::apply_local) will be accepted rather than
     /// returning [`CollabError::NotSynced`].
     ///
     /// A [`create`](Self::create)d or [`load`](Self::load)ed document is synced
-    /// from the start; a [`join`](Self::join)ed one becomes synced when the
-    /// first sync delivers the content. **Poll this** after draining each
-    /// [`receive_message`](Self::receive_message) to learn when a joiner may
-    /// start editing: an empty shared document delivers no bootstrap
-    /// [`Splice`] to announce itself, so watching the splice stream alone would
-    /// leave a joiner of an empty document read-only forever.
+    /// from the start; a [`join`](Self::join)ed one becomes synced when a peer
+    /// answers its opening message. **Poll this** rather than watching the
+    /// splice stream: an *empty* shared document delivers no splices to
+    /// announce itself, so a joiner watching for one would stay read-only
+    /// forever.
     pub fn is_synced(&self) -> bool {
-        self.text.is_some()
+        self.synced
     }
 
     /// Record a local edit the model has already applied to its buffer.
@@ -254,20 +390,15 @@ impl CollabDoc {
     /// redo — or the document and the buffer silently diverge. Follow up with
     /// the pump rule (see module docs) to get the change to the peers.
     pub fn apply_local(&mut self, change: &Change) -> Result<(), CollabError> {
-        let text = self.text.clone().ok_or(CollabError::NotSynced)?;
+        if !self.synced {
+            return Err(CollabError::NotSynced);
+        }
 
-        // Validate the whole change before touching the document. `splice_text`
-        // applies one edit at a time, so an edit that fell outside the shared
-        // text partway through a multi-cursor change would leave the document
-        // half-edited *and* `projected_len` stale — and a stale length makes
-        // every later `receive_message` fail its own arithmetic check and
-        // resynchronize the whole text, forever. Rejecting the change whole
-        // keeps that from being reachable at all.
-        //
-        // The walk is the same running-delta discipline as `Change::apply`: the
-        // edits are sorted, non-overlapping, and in pre-change coordinates,
-        // while the document mutates under them as we go.
-        let mut len = self.doc.length(&text);
+        // Validate the whole change before touching anything. A change that
+        // fails partway would leave the document edited and the mirror stale,
+        // and the mirror is what every later conversion is computed against —
+        // so a half-applied change poisons every offset that follows it.
+        let mut len = self.mirror.len_chars();
         let mut delta: isize = 0;
         for edit in change.edits() {
             let start = edit.range.start as isize + delta;
@@ -284,65 +415,108 @@ impl CollabDoc {
             len = len - removed + inserted;
         }
 
+        // The same running-delta walk as `Change::apply`: the edits are sorted,
+        // non-overlapping, and in pre-change coordinates, while the document
+        // and the mirror mutate under them as we go.
+        let mut txn = self.doc.transact_mut();
         let mut delta: isize = 0;
         for edit in change.edits() {
             let start = (edit.range.start as isize + delta) as usize;
             let removed = edit.range.end.saturating_sub(edit.range.start);
-            let inserted = edit.text.chars().count();
-            if let Err(e) = self
-                .doc
-                .splice_text(&text, start, removed as isize, &edit.text)
-            {
-                // Validated above, so this is unreachable for a range fault —
-                // but if the document rejects a splice for any other reason it
-                // has been partially edited, and the projected length must be
-                // re-derived rather than left describing a document that no
-                // longer exists.
-                self.projected_len = self.doc.length(&text);
-                return Err(CollabError::Internal(e));
+            let end = start + removed;
+
+            let start_cu = self.mirror.char_to_utf16_cu(start) as u32;
+            let end_cu = self.mirror.char_to_utf16_cu(end) as u32;
+            if end_cu > start_cu {
+                self.text
+                    .remove_range(&mut txn, start_cu, end_cu - start_cu);
             }
-            delta += inserted as isize - removed as isize;
+            if !edit.text.is_empty() {
+                self.text.insert(&mut txn, start_cu, &edit.text);
+            }
+
+            if end > start {
+                self.mirror.remove(start..end);
+            }
+            if !edit.text.is_empty() {
+                self.mirror.insert(start, &edit.text);
+            }
+            delta += edit.text.chars().count() as isize - removed as isize;
         }
-        self.projected_len = len;
+        drop(txn);
+
         debug_assert_eq!(
-            self.projected_len,
-            self.doc.length(&text),
-            "model and document disagree about the text length"
+            self.mirror.to_string(),
+            self.text.get_string(&self.doc.transact()),
+            "the mirror and the document disagree after a local change"
         );
         Ok(())
     }
 
-    /// The length of the shared text in chars — what the embedder's buffer must
-    /// hold once every splice from [`receive_message`](Self::receive_message)
-    /// has been applied.
-    ///
-    /// Checking this against the model's own length after each exchange is the
-    /// cheapest possible divergence detector, and worth doing: the internal
-    /// consistency assertions are `debug_assert`s, so in a release build — which
-    /// is what ships — nothing else would ever notice two peers drifting apart.
-    pub fn len_chars(&self) -> usize {
-        self.text.as_ref().map_or(0, |text| self.doc.length(text))
-    }
-
-    /// The next sync message for `peer`, if the conversation is not quiescent.
+    /// The next message for `peer`, if the conversation is not quiescent.
     ///
     /// See the module docs for the pump rule: call this for every peer after
     /// any local change or receive, until all peers return `None`.
     pub fn generate_message(&mut self, peer: &mut SyncSession) -> Option<Vec<u8>> {
-        self.doc
-            .sync()
-            .generate_sync_message(&mut peer.state)
-            .map(sync::Message::encode)
+        // A reply owed from the last message we handled.
+        if let Some(bytes) = peer.pending.take() {
+            return Some(bytes);
+        }
+
+        // The opening move: tell the peer what we have, so it can send the rest.
+        if !peer.opened {
+            peer.opened = true;
+            // Everything already in the outbox is part of the state this
+            // handshake will reconcile, so it must not be replayed afterwards.
+            peer.cursor = self.trimmed + self.outbox.lock().map_or(0, |o| o.len());
+            self.cursors.insert(peer.id, peer.cursor);
+            let sv = self.doc.transact().state_vector();
+            return Some(encode(&Message::Sync(SyncMessage::SyncStep1(sv))));
+        }
+
+        // Steady state: the next update this peer has not seen, skipping the
+        // ones it gave us in the first place.
+        let next = {
+            let outbox = self.outbox.lock().ok()?;
+            let mut index = peer.cursor.saturating_sub(self.trimmed);
+            let mut found = None;
+            while index < outbox.len() {
+                let (from, bytes) = &outbox[index];
+                index += 1;
+                if *from != Some(peer.id) {
+                    found = Some(bytes.clone());
+                    break;
+                }
+            }
+            peer.cursor = self.trimmed + index;
+            found
+        };
+        self.cursors.insert(peer.id, peer.cursor);
+        self.trim_outbox();
+        next.map(|update| encode(&Message::Sync(SyncMessage::Update(update))))
     }
 
-    /// Ingest one sync message from `peer`; the returned splices replay every
-    /// remote edit it carried onto the model's buffer (sequentially — see
-    /// [`Splice`]).
+    /// Drop outbox entries every known session has consumed.
+    fn trim_outbox(&mut self) {
+        let Some(min) = self.cursors.values().copied().min() else {
+            return;
+        };
+        let drop_to = min.saturating_sub(self.trimmed);
+        if drop_to == 0 {
+            return;
+        }
+        if let Ok(mut outbox) = self.outbox.lock() {
+            let drop_to = drop_to.min(outbox.len());
+            outbox.drain(..drop_to);
+            self.trimmed += drop_to;
+        }
+    }
+
+    /// Ingest one message from `peer`; the returned splices replay every remote
+    /// edit it carried onto the model's buffer (sequentially — see [`Splice`]).
     ///
-    /// A joiner's first content-bearing batch is a single splice inserting the
-    /// whole text (unless that text is empty — see
-    /// [`is_synced`](Self::is_synced)). Remember the pump rule: receiving
-    /// usually obligates responses, to this peer and every other.
+    /// Remember the pump rule: receiving usually obligates responses, to this
+    /// peer and every other.
     ///
     /// Malformed or unapplicable input from `peer` returns
     /// [`CollabError::BadMessage`] or [`CollabError::BadPeerData`] and leaves
@@ -353,326 +527,148 @@ impl CollabDoc {
         peer: &mut SyncSession,
         bytes: &[u8],
     ) -> Result<Vec<Splice>, CollabError> {
-        let message = sync::Message::decode(bytes).map_err(CollabError::BadMessage)?;
-        let mut log = PatchLog::active();
-        // Only the envelope was validated at decode; the change payload is
-        // opaque until applied here, so a corrupt or conflicting change from an
-        // untrusted peer surfaces now — as a broken connection, not a bug.
-        self.doc
-            .sync()
-            .receive_sync_message_log_patches(&mut peer.state, message, &mut log)
-            .map_err(CollabError::BadPeerData)?;
-        let patches = self.doc.make_patches(&mut log);
+        let message = Message::decode_v1(bytes).map_err(CollabError::BadMessage)?;
+        match message {
+            Message::Sync(SyncMessage::SyncStep1(their_sv)) => {
+                // They told us what they have; owe them the difference.
+                let update = self.doc.transact().encode_diff_v1(&their_sv);
+                peer.pending = Some(encode(&Message::Sync(SyncMessage::SyncStep2(update))));
+                Ok(Vec::new())
+            }
+            Message::Sync(SyncMessage::SyncStep2(update))
+            | Message::Sync(SyncMessage::Update(update)) => {
+                let update = Update::decode_v1(&update).map_err(CollabError::BadMessage)?;
+                let splices = self.apply_remote_update(update, peer.id)?;
+                // A step 2 is the answer to our opening move: the content, such
+                // as it is, has arrived. An empty document produces no splices
+                // at all, which is exactly why readiness is a flag and not an
+                // observation of the splice stream.
+                self.synced = true;
+                Ok(splices)
+            }
+            // Awareness rides the same channel in the y-sync protocol. Presence
+            // is a later increment; ignoring these keeps us interoperable with
+            // peers that send them rather than treating them as corrupt.
+            Message::Awareness(_) | Message::AwarenessQuery | Message::Auth(_) => Ok(Vec::new()),
+            Message::Custom(_, _) => Ok(Vec::new()),
+        }
+    }
 
-        let old_len = self.projected_len;
-        let winner = content_text(&self.doc);
-        let splices = if winner != self.text {
-            // The content object appeared or changed identity — the normal join
-            // bootstrap (None → Some) or the create/create misuse. The text the
-            // model mirrors is no longer the document's, so per-patch replay is
-            // meaningless: resync the whole thing.
-            self.text = winner;
-            self.full_replace(old_len)
-        } else if let Some(text) = self.text.clone() {
-            // Replay the recognized text edits in order. A patch on the text
-            // object we do NOT recognize — a block marker from a peer speaking
-            // richer automerge than this plain-text mirror, say — makes the
-            // incremental replay untrustworthy. Rather than panic (as a
-            // debug_assert would) or silently drop it and diverge (as a release
-            // build would), fall back to a full replace so the model still
-            // faithfully reflects `doc.text()`. Normal collaborative text never
-            // reaches this fallback: scalar and object inserts into a Text
-            // arrive from automerge as `SpliceText` of U+FFFC, so only genuine
-            // rich-text structure (which we don't model) trips it.
-            let mut out = Vec::new();
-            let mut surprised = false;
-            for patch in patches.iter().filter(|patch| patch.obj == text) {
-                match classify(&patch.action) {
-                    TextPatch::Edit(splice) => out.push(splice),
-                    TextPatch::NoOp => {}
-                    TextPatch::Unknown => surprised = true,
-                }
-            }
-            // The recognized edits must reproduce the document's new length; if
-            // a surprise appeared or the arithmetic disagrees, they don't — so
-            // resync instead of emitting splices that would desync the model.
-            if surprised || fold_len(old_len, &out) != self.doc.length(&text) {
-                self.full_replace(old_len)
-            } else {
-                out
-            }
-        } else {
-            // No content object anywhere yet (two joiners with no creator).
-            Vec::new()
+    /// Apply a remote update, capturing the text changes it produced and
+    /// converting them to char-offset splices.
+    fn apply_remote_update(
+        &mut self,
+        update: Update,
+        from: u64,
+    ) -> Result<Vec<Splice>, CollabError> {
+        *self.steps.lock().expect("collector mutex") = Some(Vec::new());
+        let result = {
+            // Tagged with the session it came from, so the update observer can
+            // keep it from being sent straight back down the same connection.
+            let mut txn = self.doc.transact_mut_with(session_origin(from));
+            txn.apply_update(update)
         };
+        let steps = self
+            .steps
+            .lock()
+            .expect("collector mutex")
+            .take()
+            .unwrap_or_default();
 
-        // Having applied `splices`, the model now holds exactly `doc.text()`.
-        self.projected_len = self.text.as_ref().map_or(0, |text| self.doc.length(text));
+        if let Err(e) = result {
+            // The document rejected it; the mirror was never touched.
+            return Err(CollabError::BadPeerData(e));
+        }
+
+        let splices = self.drain_steps(steps);
         debug_assert_eq!(
-            fold_len(old_len, &splices),
-            self.projected_len,
-            "emitted splices do not reproduce the document length"
+            self.mirror.to_string(),
+            self.text.get_string(&self.doc.transact()),
+            "the mirror and the document disagree after a remote update"
         );
         Ok(splices)
     }
 
+    /// Turn a captured delta walk into sequential [`Splice`]s, updating the
+    /// mirror as it goes.
+    ///
+    /// yrs reports a *relative* walk — retain, insert, delete, with each step
+    /// addressed to the text the previous steps produced — which is precisely
+    /// the sequential contract [`Splice`] documents. The only work is the
+    /// units: yrs counts UTF-16 code units, we speak chars, and the mirror is
+    /// what converts between them. Because the mirror is mutated step by step,
+    /// each conversion is computed against exactly the text that step sees.
+    fn drain_steps(&mut self, steps: Vec<Step>) -> Vec<Splice> {
+        if steps.iter().any(|s| matches!(s, Step::Unrepresentable)) {
+            return self.full_replace();
+        }
+
+        let mut splices = Vec::new();
+        let mut at = 0usize; // char cursor
+        for step in steps {
+            match step {
+                Step::Retain(units) => {
+                    let cu = self.mirror.char_to_utf16_cu(at) + units as usize;
+                    at = self
+                        .mirror
+                        .utf16_cu_to_char(cu.min(self.mirror.len_utf16_cu()));
+                }
+                Step::Insert(s) => {
+                    self.mirror.insert(at, &s);
+                    let inserted = s.chars().count();
+                    splices.push(Splice::new(at, 0, s));
+                    at += inserted;
+                }
+                Step::Delete(units) => {
+                    let cu = self.mirror.char_to_utf16_cu(at) + units as usize;
+                    let end = self
+                        .mirror
+                        .utf16_cu_to_char(cu.min(self.mirror.len_utf16_cu()));
+                    if end > at {
+                        self.mirror.remove(at..end);
+                        splices.push(Splice::new(at, end - at, ""));
+                    }
+                }
+                Step::Unrepresentable => unreachable!("checked above"),
+            }
+        }
+        splices
+    }
+
     /// The single splice that rewrites the model's whole text to the document's
-    /// current text — the resync used for bootstrap and for any surprise that
-    /// makes incremental replay untrustworthy. `old_len` is the model's char
-    /// count before this splice, i.e. exactly what must be deleted.
-    fn full_replace(&self, old_len: usize) -> Vec<Splice> {
-        let insert = self.text();
-        if old_len == 0 && insert.is_empty() {
+    /// — the resync for anything this plain-text projection cannot replay.
+    ///
+    /// A peer speaking richer Yjs than we model (formatting attributes, an
+    /// embedded value) can produce a delta we would otherwise have to guess at.
+    /// Guessing would desynchronize the model silently; resyncing is loud,
+    /// correct, and rare.
+    fn full_replace(&mut self) -> Vec<Splice> {
+        let truth = self.text.get_string(&self.doc.transact());
+        let old_len = self.mirror.len_chars();
+        self.mirror = Rope::from_str(&truth);
+        if old_len == 0 && truth.is_empty() {
             Vec::new()
         } else {
-            vec![Splice {
-                pos: 0,
-                del: old_len,
-                insert,
-            }]
+            vec![Splice::new(0, old_len, truth)]
         }
     }
 }
 
-/// The winning `Text` at `ROOT["content"]`, if one exists.
-fn content_text(doc: &AutoCommit) -> Option<ObjId> {
-    match doc.get(ROOT, "content") {
-        Ok(Some((Value::Object(ObjType::Text), id))) => Some(id),
-        _ => None,
-    }
+fn encode(message: &Message) -> Vec<u8> {
+    message.encode_v1()
 }
 
-/// A text-object patch, sorted into what a plain-text mirror can do with it.
-enum TextPatch {
-    /// A recognized text edit to replay on the model.
-    Edit(Splice),
-    /// A patch that targets the text but moves no characters (a mark) — ignore.
-    NoOp,
-    /// A patch beyond a plain-text projection (e.g. a block marker inserted by
-    /// a peer speaking richer automerge). The caller resyncs rather than guess.
-    Unknown,
+/// Tag a transaction with the session that caused it.
+///
+/// Only the round trip matters, so the cheapest encoding yrs offers a
+/// non-`ClientID` value is fine. An origin we cannot parse simply reads as
+/// "not from any session", which is the safe answer: the update gets offered to
+/// every peer rather than withheld from one.
+fn session_origin(id: u64) -> Origin {
+    Origin::from(id.to_string())
 }
 
-/// Sort a text-object patch into a [`TextPatch`]. Character offsets and lengths
-/// are already in Unicode scalar values (the crate's invariant), so no
-/// conversion is needed.
-fn classify(action: &PatchAction) -> TextPatch {
-    match action {
-        PatchAction::SpliceText { index, value, .. } => TextPatch::Edit(Splice {
-            pos: *index,
-            del: 0,
-            insert: value.make_string(),
-        }),
-        PatchAction::DeleteSeq { index, length } => TextPatch::Edit(Splice {
-            pos: *index,
-            del: *length,
-            insert: String::new(),
-        }),
-        // Marks annotate a span without moving text; nothing for a plain-text
-        // mirror to do.
-        PatchAction::Mark { .. } => TextPatch::NoOp,
-        // Anything else on a Text object is beyond this projection. Signal a
-        // resync rather than corrupt the model by dropping it.
-        _ => TextPatch::Unknown,
-    }
-}
-
-/// Fold a batch of sequential splices into the char count they produce from a
-/// text of length `start`.
-fn fold_len(start: usize, splices: &[Splice]) -> usize {
-    let mut len = start as isize;
-    for splice in splices {
-        len += splice.insert.chars().count() as isize - splice.del as isize;
-    }
-    len.max(0) as usize
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rinch_code_editor_buffer::{Buffer, Edit};
-
-    /// The load-bearing equivalence: `apply_local`'s running-delta walk lands
-    /// every edit at the same place `Change::apply` does, including multi-
-    /// cursor changes and text where chars ≠ bytes.
-    #[test]
-    fn apply_local_matches_change_apply() {
-        for (initial, edits) in [
-            ("hello world", vec![Edit::insert(5, ",")]),
-            (
-                "abc",
-                vec![
-                    Edit::insert(0, "x"),
-                    Edit::insert(1, "yy"),
-                    Edit::insert(3, "z"),
-                ],
-            ),
-            (
-                "one two three",
-                vec![
-                    Edit::replace(0..3, "1"),
-                    Edit::delete(4..7),
-                    Edit::replace(8..13, "33333"),
-                ],
-            ),
-            (
-                "héllo 🦀 wörld",
-                vec![Edit::replace(1..2, "é🦀é"), Edit::delete(6..8)],
-            ),
-            // Touching edits (one ends exactly where the next begins) and two
-            // insertions at the same offset — both legal (non-overlapping) and
-            // the running-delta walk must keep them aligned.
-            (
-                "abcdef",
-                vec![Edit::replace(0..3, "XYZ"), Edit::replace(3..6, "W")],
-            ),
-            ("abc", vec![Edit::insert(1, "1"), Edit::insert(1, "2")]),
-        ] {
-            let mut buffer = Buffer::from_text(initial);
-            let mut doc = CollabDoc::create(initial);
-            let change = Change::apply(&mut buffer, edits);
-            doc.apply_local(&change).unwrap();
-            assert_eq!(doc.text(), buffer.text(), "diverged from {initial:?}");
-        }
-    }
-
-    #[test]
-    fn undo_applied_as_a_change_round_trips() {
-        let mut buffer = Buffer::from_text("hello world");
-        let mut doc = CollabDoc::create("hello world");
-        let change = Change::apply(&mut buffer, vec![Edit::replace(0..5, "goodbye")]);
-        doc.apply_local(&change).unwrap();
-
-        // C2 will capture an undo as a fresh Change built from the inverse
-        // edits; the doc must track it like any other local change.
-        let undo = Change::apply(&mut buffer, change.inverse().to_vec());
-        doc.apply_local(&undo).unwrap();
-        assert_eq!(doc.text(), "hello world");
-        assert_eq!(buffer.text(), "hello world");
-    }
-
-    #[test]
-    fn local_edit_before_first_sync_is_refused() {
-        let mut buffer = Buffer::from_text("");
-        let mut doc = CollabDoc::join();
-        let change = Change::apply(&mut buffer, vec![Edit::insert(0, "too eager")]);
-        assert!(matches!(
-            doc.apply_local(&change),
-            Err(CollabError::NotSynced)
-        ));
-    }
-
-    #[test]
-    fn is_synced_reflects_content_presence() {
-        assert!(
-            CollabDoc::create("x").is_synced(),
-            "creator is synced at once"
-        );
-        assert!(CollabDoc::create("").is_synced(), "even an empty creator");
-        assert!(
-            !CollabDoc::join().is_synced(),
-            "a fresh joiner is not synced"
-        );
-        let mut seed = CollabDoc::create("x");
-        assert!(
-            CollabDoc::load(&seed.save()).unwrap().is_synced(),
-            "a loaded document is synced"
-        );
-    }
-
-    #[test]
-    fn empty_change_is_a_harmless_readiness_probe_before_sync() {
-        // NotSynced is returned *before* the doc is touched, so an empty Change
-        // probes readiness without mutating anything — but is_synced() is the
-        // intended, side-effect-free way to ask.
-        let mut doc = CollabDoc::join();
-        let empty = Change::apply(&mut Buffer::from_text(""), vec![]);
-        assert!(matches!(
-            doc.apply_local(&empty),
-            Err(CollabError::NotSynced)
-        ));
-        assert_eq!(doc.text(), "");
-    }
-
-    #[test]
-    fn empty_change_on_a_synced_doc_is_a_noop() {
-        let mut doc = CollabDoc::create("unchanged");
-        let empty = Change::apply(&mut Buffer::from_text("unchanged"), vec![]);
-        doc.apply_local(&empty).unwrap();
-        assert_eq!(doc.text(), "unchanged");
-    }
-
-    #[test]
-    fn a_change_reaching_past_the_shared_text_is_rejected_whole() {
-        // The model and the document have disagreed about the contents — an
-        // integration bug. What matters is that the document does not end up
-        // half-edited with a projected length describing a document that no
-        // longer exists: that length is what every later receive checks its own
-        // arithmetic against, so a stale one resynchronizes the whole text on
-        // every message, forever.
-        let mut doc = CollabDoc::create("abc");
-        let mut long = Buffer::from_text("abcdefgh");
-        let change = Change::apply(&mut long, vec![Edit::insert(0, "!"), Edit::delete(5..8)]);
-
-        let err = doc.apply_local(&change).unwrap_err();
-        // `len` is the length as of the failing edit — the insertion before it
-        // has already been accounted for by the running walk, exactly as it
-        // would have been had the change been applied.
-        assert!(
-            matches!(
-                err,
-                CollabError::OutOfRange {
-                    pos: 5,
-                    del: 3,
-                    len: 4
-                }
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(doc.text(), "abc", "the first edit must not have landed");
-        assert_eq!(doc.len_chars(), 3);
-
-        // And the document still works: the projected length was never spoiled.
-        let mut buffer = Buffer::from_text("abc");
-        let ok = Change::apply(&mut buffer, vec![Edit::insert(3, "d")]);
-        doc.apply_local(&ok).unwrap();
-        assert_eq!(doc.text(), "abcd");
-    }
-
-    #[test]
-    fn len_chars_tracks_the_shared_text() {
-        let mut doc = CollabDoc::create("héllo 🦀");
-        assert_eq!(doc.len_chars(), 7, "chars, not bytes");
-        assert_eq!(CollabDoc::join().len_chars(), 0);
-
-        let mut buffer = Buffer::from_text("héllo 🦀");
-        let change = Change::apply(&mut buffer, vec![Edit::delete(0..6)]);
-        doc.apply_local(&change).unwrap();
-        assert_eq!(doc.len_chars(), 1);
-    }
-
-    #[test]
-    fn snapshot_round_trip_preserves_text() {
-        let mut doc = CollabDoc::create("héllo 🦀");
-        let loaded = CollabDoc::load(&doc.save()).unwrap();
-        assert_eq!(loaded.text(), "héllo 🦀");
-    }
-
-    #[test]
-    fn loading_a_foreign_document_is_refused() {
-        use automerge::transaction::Transactable;
-        let mut foreign = automerge::AutoCommit::new();
-        foreign
-            .put(automerge::ROOT, "content", "a string, not a Text")
-            .unwrap();
-        let bytes = foreign.save();
-        assert!(matches!(
-            CollabDoc::load(&bytes),
-            Err(CollabError::SnapshotMissingContent)
-        ));
-        assert!(matches!(
-            CollabDoc::load(b"not an automerge document"),
-            Err(CollabError::BadSnapshot(_))
-        ));
-    }
+/// Recover the session id a transaction was tagged with, if any.
+fn origin_session(origin: &Origin) -> Option<u64> {
+    std::str::from_utf8(origin.as_ref()).ok()?.parse().ok()
 }

@@ -7,11 +7,16 @@ repository.workspace = true
 description = "Transport-agnostic collaborative editing for the rinch code editor (automerge)"
 
 [dependencies]
-# The version pin, and more importantly the *feature* pin that keeps
-# automerge's Text indexed in Unicode scalar values, are documented in the
-# workspace manifest. The `automerge_text_indexing_is_unicode_code_points` test
-# in lib.rs is what enforces it.
-automerge.workspace = true
+# The engine. The version pin, the `sync` feature, and the offset-encoding
+# invariant are documented in the workspace manifest; `lib.rs`'s pin test is
+# what enforces the last of them.
+yrs.workspace = true
+
+# The text mirror this crate keeps beside the CRDT, purely so char offsets can
+# be converted to and from yrs's UTF-16 indexing exactly and in O(log n). It
+# also supersedes the old `projected_len`: comparing the mirror against the
+# document is the divergence detector.
+ropey.workspace = true
 
 rinch-code-editor-buffer.workspace = true
 

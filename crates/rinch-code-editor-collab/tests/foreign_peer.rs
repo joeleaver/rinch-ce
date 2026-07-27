@@ -1,209 +1,208 @@
-//! Robustness against automerge peers that are *not* this crate.
+//! Robustness against a peer that is not us.
 //!
-//! The collab core is a transport-agnostic mirror speaking the standard
-//! automerge sync protocol, so a peer can be any automerge client — including
-//! one that uses Text features this plain-text projection does not model, or
-//! one sending corrupt or hostile bytes. None of that may panic the editor or
-//! silently diverge the mirror: the contract is a faithful reflection of
-//! `doc.text()`, a typed error, or nothing — never a crash, never corruption.
+//! The engine models far more than the plain text this crate projects: a peer
+//! built on the same CRDT can format a range or embed a value, and a hostile one
+//! can send rubbish. None of that may panic, silently desynchronize the model,
+//! or be mistaken for corruption when it is merely richer than we render.
 //!
-//! These tests drive a raw [`automerge::AutoCommit`] against a [`CollabDoc`]
-//! through real sync bytes, so they exercise exactly what a foreign client on
-//! the wire would produce.
+//! These drive a raw yrs document as the foreign peer, so they exercise the real
+//! wire format rather than a mock of it. They replace the automerge-era versions
+//! (block markers, corrupt change chunks, garbage envelopes) test for test; the
+//! hazard is the same, only the vocabulary of "richer than plain text" changed.
 
-use automerge::sync::SyncDoc;
-use automerge::transaction::Transactable;
-use automerge::{AutoCommit, ObjType, ROOT, ReadDoc};
-use rinch_code_editor_buffer::{Buffer, Change, Edit};
-use rinch_code_editor_collab::{CollabDoc, CollabError, SyncSession};
+use rinch_code_editor_buffer::{Buffer, Change};
+use rinch_code_editor_collab::{CollabDoc, CollabError, Splice, SyncSession};
+use yrs::sync::{Message, SyncMessage};
+use yrs::types::Attrs;
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
+use yrs::{Any, Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, Transact, Update};
 
-/// The content Text object of a document, by the crate's own convention.
-fn content(doc: &AutoCommit) -> automerge::ObjId {
-    let (val, id) = doc.get(ROOT, "content").unwrap().unwrap();
-    assert_eq!(val, automerge::Value::Object(ObjType::Text));
-    id
-}
-
-/// A foreign automerge peer that shares one `CollabDoc`'s document, driven
-/// through the real sync protocol so its edits reach the `CollabDoc` as wire
-/// bytes — the way any non-crate automerge client would appear.
+/// A peer speaking the same protocol directly, with none of our restraint.
 struct Foreign {
-    doc: AutoCommit,
-    state: automerge::sync::State,
+    doc: Doc,
+    text: yrs::TextRef,
 }
 
 impl Foreign {
-    /// Fork a foreign peer from a collab doc's current snapshot; both then
-    /// share the same content Text object identity.
-    fn fork(collab: &mut CollabDoc) -> Self {
-        Self {
-            doc: AutoCommit::load(&collab.save()).unwrap(),
-            state: automerge::sync::State::new(),
+    fn new() -> Self {
+        let options = Options {
+            offset_kind: OffsetKind::Utf16,
+            ..Options::default()
+        };
+        let doc = Doc::with_options(options);
+        let text = doc.get_or_insert_text("content");
+        Self { doc, text }
+    }
+
+    fn state(&self) -> StateVector {
+        self.doc.transact().state_vector()
+    }
+
+    fn sync_step1(&self) -> Vec<u8> {
+        Message::Sync(SyncMessage::SyncStep1(self.state())).encode_v1()
+    }
+
+    /// Everything we hold that a peer at `sv` does not, as an Update message.
+    fn update_since(&self, sv: &StateVector) -> Vec<u8> {
+        let update = self.doc.transact().encode_diff_v1(sv);
+        Message::Sync(SyncMessage::Update(update)).encode_v1()
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) {
+        if let Ok(Message::Sync(msg)) = Message::decode_v1(bytes) {
+            let payload = match msg {
+                SyncMessage::SyncStep2(u) | SyncMessage::Update(u) => u,
+                SyncMessage::SyncStep1(_) => return,
+            };
+            if let Ok(update) = Update::decode_v1(&payload) {
+                let mut txn = self.doc.transact_mut();
+                let _ = txn.apply_update(update);
+            }
         }
     }
 
-    fn text_id(&self) -> automerge::ObjId {
-        content(&self.doc)
-    }
-
-    /// Sync this peer with a collab doc until quiescent, applying every emitted
-    /// splice to `model` and asserting the model never diverges from the doc.
-    fn sync(&mut self, collab: &mut CollabDoc, peer: &mut SyncSession, model: &mut Buffer) {
-        for _ in 0..100 {
-            let mut moved = false;
-            if let Some(msg) = self.doc.sync().generate_sync_message(&mut self.state) {
-                let splices = collab.receive_message(peer, &msg.encode()).unwrap();
-                for splice in &splices {
-                    Change::apply(
-                        model,
-                        vec![Edit::replace(
-                            splice.pos..splice.pos + splice.del,
-                            splice.insert.clone(),
-                        )],
-                    );
-                }
-                assert_eq!(
-                    model.text(),
-                    collab.text(),
-                    "mirror diverged from the collab document after a foreign sync"
-                );
-                moved = true;
-            }
-            if let Some(bytes) = collab.generate_message(peer) {
-                let msg = automerge::sync::Message::decode(&bytes).unwrap();
-                self.doc
-                    .sync()
-                    .receive_sync_message(&mut self.state, msg)
-                    .unwrap();
-                moved = true;
-            }
-            if !moved {
-                return;
-            }
-        }
-        panic!("foreign sync did not reach quiescence");
+    fn text(&self) -> String {
+        self.text.get_string(&self.doc.transact())
     }
 }
 
-#[test]
-fn foreign_block_marker_does_not_panic_and_mirror_stays_faithful() {
-    // The defect this pins: a foreign peer calling the public `split_block`
-    // inserts a Map block marker into the Text. That arrives as
-    // PatchAction::Insert on the text object — which a naive matcher would
-    // debug_assert-panic on (debug) or silently drop (release, desyncing the
-    // mirror by the marker's one U+FFFC position). The mirror must instead
-    // resync and keep reflecting doc.text() exactly.
-    let mut collab = CollabDoc::create("hello world");
-    let mut model = Buffer::from_text(&collab.text());
-    let mut peer = SyncSession::new();
-
-    let mut foreign = Foreign::fork(&mut collab);
-    let text = foreign.text_id();
-    foreign.doc.split_block(&text, 5).unwrap();
-    // ...and a plain edit after the marker, to prove subsequent offsets are not
-    // skewed by one against the model.
-    foreign.doc.splice_text(&text, 7, 0, "X").unwrap();
-
-    foreign.sync(&mut collab, &mut peer, &mut model);
-
-    // The plain-text projection of a block marker is U+FFFC; the mirror holds
-    // exactly what the document holds, no panic, no off-by-one.
-    assert!(
-        collab.text().contains('\u{fffc}'),
-        "marker should be present"
-    );
-    assert!(collab.text().contains('X'));
-    assert_eq!(model.text(), collab.text());
-}
-
-#[test]
-fn foreign_edits_after_a_marker_keep_converging() {
-    // After the resync, ordinary collaboration must continue to work: a foreign
-    // insert past the marker and a local edit both land correctly.
-    let mut collab = CollabDoc::create("abcdef");
-    let mut model = Buffer::from_text(&collab.text());
-    let mut peer = SyncSession::new();
-
-    let mut foreign = Foreign::fork(&mut collab);
-    let text = foreign.text_id();
-    foreign.doc.split_block(&text, 3).unwrap();
-    foreign.sync(&mut collab, &mut peer, &mut model);
-    assert_eq!(model.text(), collab.text());
-
-    // A local edit while the marker is present still round-trips to the peer.
-    let change = Change::apply(&mut model, vec![Edit::insert(0, ">")]);
-    collab.apply_local(&change).unwrap();
-    foreign.sync(&mut collab, &mut peer, &mut model);
-
-    // And a further foreign edit still converges.
-    let text = foreign.text_id();
-    let end = foreign.doc.length(&text);
-    foreign.doc.splice_text(&text, end, 0, "!").unwrap();
-    foreign.sync(&mut collab, &mut peer, &mut model);
-    assert_eq!(model.text(), collab.text());
-    assert!(collab.text().starts_with('>') && collab.text().ends_with('!'));
-}
-
-#[test]
-fn corrupt_change_payload_is_bad_peer_data_not_a_crash() {
-    // A structurally valid sync envelope whose change chunk is garbage decodes
-    // fine (so it is NOT BadMessage) but fails when applied. A joiner's empty
-    // document takes automerge's strict first-chunk-load path, so this surfaces
-    // as an error rather than being silently tolerated — and it must be the
-    // peer-fault BadPeerData, the crate's must-disconnect signal, never the
-    // must-crash Internal variant.
-    let mut creator = CollabDoc::create("shared");
-    let mut joiner = CollabDoc::join();
-    let mut c_to_j = SyncSession::new();
-    let mut j_to_c = SyncSession::new();
-
-    // Let the creator produce a real, content-bearing sync message for the
-    // joiner (drive the handshake far enough that changes are sent).
-    let mut real = None;
-    for _ in 0..10 {
-        if let Some(bytes) = creator.generate_message(&mut c_to_j) {
-            let msg = automerge::sync::Message::decode(&bytes).unwrap();
-            if !msg.changes.is_empty() {
-                real = Some(msg);
-                break;
-            }
-            // Feed the joiner's reply back so the handshake advances.
-            let splices = joiner.receive_message(&mut j_to_c, &bytes).unwrap();
-            assert!(splices.is_empty());
-            if let Some(reply) = joiner.generate_message(&mut j_to_c) {
-                creator
-                    .receive_message(&mut c_to_j, &reply)
-                    .expect("creator handles the joiner's reply");
-            }
-        } else {
-            break;
-        }
+/// Bring a foreign peer up to date with ours.
+fn introduce(ours: &mut CollabDoc, session: &mut SyncSession, theirs: &mut Foreign) {
+    let step1 = theirs.sync_step1();
+    ours.receive_message(session, &step1).unwrap();
+    while let Some(msg) = ours.generate_message(session) {
+        theirs.absorb(&msg);
     }
-    let mut msg = real.expect("creator should eventually send a change-bearing message");
+}
 
-    // Corrupt the change payload while keeping the envelope well-formed.
-    msg.changes = vec![vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02, 0x03]].into();
-    let corrupt = msg.encode();
-    // It still decodes as a sync message — the envelope is valid.
-    assert!(automerge::sync::Message::decode(&corrupt).is_ok());
-
-    let err = joiner
-        .receive_message(&mut j_to_c, &corrupt)
-        .expect_err("a garbage change payload must be rejected");
-    assert!(
-        matches!(err, CollabError::BadPeerData(_)),
-        "untrusted payload must be BadPeerData (drop the connection), got {err:?}"
+/// Replaying the emitted splices onto the model must reproduce the document —
+/// the contract every remote batch has to keep, however it was produced.
+#[track_caller]
+fn assert_replayable(start: &str, splices: &[Splice], doc: &CollabDoc) {
+    let mut model = Buffer::from_text(start);
+    for splice in splices {
+        let len = model.len_chars();
+        Change::apply(&mut model, vec![splice.to_edit(len)]);
+    }
+    assert_eq!(
+        model.text(),
+        doc.text(),
+        "replaying the emitted splices diverged from the document"
     );
 }
 
 #[test]
-fn garbage_envelope_is_bad_message() {
-    // Bytes that are not even a valid sync envelope are the other untrusted-
-    // input variant. Both are recoverable-by-disconnect, never a crash.
-    let mut joiner = CollabDoc::join();
-    let mut peer = SyncSession::new();
-    let err = joiner
-        .receive_message(&mut peer, b"not a sync message at all")
-        .expect_err("garbage bytes must be rejected");
-    assert!(matches!(err, CollabError::BadMessage(_)), "got {err:?}");
+fn a_peer_formatting_a_range_keeps_the_projection_honest() {
+    // Formatting changes the text in a way a plain-text projection cannot
+    // represent. Guessing would desynchronize the model silently; the crate
+    // resynchronizes instead, and the model still ends up holding exactly what
+    // the document holds.
+    let mut ours = CollabDoc::create("hello world");
+    let mut session = SyncSession::new();
+    let mut theirs = Foreign::new();
+    introduce(&mut ours, &mut session, &mut theirs);
+    assert_eq!(theirs.text(), "hello world");
+
+    let before = theirs.state();
+    {
+        let mut attrs = Attrs::new();
+        attrs.insert("bold".into(), Any::Bool(true));
+        let mut txn = theirs.doc.transact_mut();
+        theirs.text.format(&mut txn, 0, 5, attrs);
+    }
+    let msg = theirs.update_since(&before);
+    let splices = ours.receive_message(&mut session, &msg).unwrap();
+
+    assert_eq!(ours.text(), theirs.text(), "text must not drift");
+    assert_replayable("hello world", &splices, &ours);
+}
+
+#[test]
+fn plain_edits_after_a_formatted_range_still_converge() {
+    // The resync must not leave the session wedged: ordinary typing from the
+    // same peer afterwards has to keep flowing.
+    let mut ours = CollabDoc::create("hello world");
+    let mut session = SyncSession::new();
+    let mut theirs = Foreign::new();
+    introduce(&mut ours, &mut session, &mut theirs);
+
+    let before = theirs.state();
+    {
+        let mut attrs = Attrs::new();
+        attrs.insert("italic".into(), Any::Bool(true));
+        let mut txn = theirs.doc.transact_mut();
+        theirs.text.format(&mut txn, 6, 5, attrs);
+    }
+    let msg = theirs.update_since(&before);
+    ours.receive_message(&mut session, &msg).unwrap();
+
+    let before = theirs.state();
+    {
+        let mut txn = theirs.doc.transact_mut();
+        theirs.text.insert(&mut txn, 11, "!");
+    }
+    let msg = theirs.update_since(&before);
+    let splices = ours.receive_message(&mut session, &msg).unwrap();
+
+    assert_eq!(ours.text(), theirs.text());
+    assert_eq!(ours.text(), "hello world!");
+    assert!(
+        !splices.is_empty(),
+        "an ordinary insertion after a resync must still be reported"
+    );
+}
+
+#[test]
+fn a_peer_embedding_a_value_does_not_desynchronize_the_model() {
+    let mut ours = CollabDoc::create("abc");
+    let mut session = SyncSession::new();
+    let mut theirs = Foreign::new();
+    introduce(&mut ours, &mut session, &mut theirs);
+
+    let before = theirs.state();
+    {
+        let mut txn = theirs.doc.transact_mut();
+        theirs
+            .text
+            .insert_embed(&mut txn, 1, Any::Map(Default::default()));
+    }
+    let msg = theirs.update_since(&before);
+    let splices = ours.receive_message(&mut session, &msg).unwrap();
+
+    assert_eq!(ours.text(), theirs.text());
+    assert_replayable("abc", &splices, &ours);
+}
+
+#[test]
+fn garbage_bytes_are_refused_without_touching_the_document() {
+    let mut doc = CollabDoc::create("intact");
+    let mut session = SyncSession::new();
+    let err = doc
+        .receive_message(&mut session, b"not a protocol message at all")
+        .unwrap_err();
+    assert!(
+        matches!(err, CollabError::BadMessage(_)),
+        "untrusted bytes must be a peer fault, not a crash: {err:?}"
+    );
+    assert_eq!(doc.text(), "intact");
+}
+
+#[test]
+fn a_corrupt_update_payload_is_a_peer_fault() {
+    // A well-formed envelope wrapped around rubbish: the envelope check passes
+    // and the payload is opaque until applied, which is exactly where the
+    // automerge-era version of this test found a mislabelled error.
+    let mut doc = CollabDoc::create("hello");
+    let mut session = SyncSession::new();
+    let corrupt = Message::Sync(SyncMessage::Update(vec![0xff, 0xfe, 0xfd, 0x00])).encode_v1();
+    let err = doc.receive_message(&mut session, &corrupt).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CollabError::BadMessage(_) | CollabError::BadPeerData(_)
+        ),
+        "a corrupt payload must blame the peer: {err:?}"
+    );
+    assert_eq!(doc.text(), "hello", "and leave the document untouched");
 }

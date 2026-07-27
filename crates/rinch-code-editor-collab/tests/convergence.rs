@@ -385,9 +385,12 @@ fn late_joiner_catches_up_and_participates() {
 }
 
 #[test]
-fn dual_create_misuse_repairs_to_one_winner() {
-    // The documented misuse: both peers `create`. The merge keeps exactly one
-    // text; the loser must be repaired onto the winner, not left diverged.
+fn dual_create_loses_nothing() {
+    // Under the previous engine this was a documented *misuse*: both peers
+    // creating the content object made two of them, the merge kept one, and the
+    // loser's text was silently destroyed. yrs keys root types by name and
+    // creates them implicitly, so there is no container operation to conflict —
+    // both peers' text simply merges. Nothing to repair, and nothing lost.
     let mut net = Net::new(
         vec![CollabDoc::create("alpha"), CollabDoc::create("beta")],
         &[(0, 1)],
@@ -395,9 +398,12 @@ fn dual_create_misuse_repairs_to_one_winner() {
     net.pump();
     net.assert_converged();
     let text = net.peers[0].doc.text();
-    assert!(text == "alpha" || text == "beta", "{text:?}");
+    assert!(
+        text.contains("alpha") && text.contains("beta"),
+        "both peers' text must survive the merge: {text:?}"
+    );
 
-    // And the surviving session still edits normally afterwards.
+    // And the session still edits normally afterwards.
     net.edit(0, vec![Edit::insert(0, "0")]);
     net.edit(1, vec![Edit::insert(0, "1")]);
     net.pump();

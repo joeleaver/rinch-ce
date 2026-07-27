@@ -65,15 +65,21 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-md = "0.5"
 
-# Collab. Pinned to the 0.10 line (the "automerge 3" hexane core), with NO
-# features on any target: with neither `utf8-indexing` nor `utf16-indexing`
-# enabled, automerge indexes Text in Unicode scalar values — exactly ropey's
-# char indexing, so splices and patches cross the boundary with no offset
-# conversion. A test in the collab crate pins this: a transitive dependency
-# silently enabling either feature would corrupt every exchanged offset. (On
-# wasm builds the consumer enables automerge's `wasm` feature; it does not
-# affect indexing.)
-automerge = "0.10"
+# Collab. yrs (the Rust core of Yjs), replacing automerge 0.10 — see the C1.5
+# increment. Two measured reasons: automerge applies one remote character in
+# O(document) (14 ms on a 90 KB file, 38 ms on 240 KB, versus a flat 0.9 us for
+# yrs), and it cannot build for wasm32-unknown-unknown without a getrandom shim,
+# while yrs builds for wasm with no features at all.
+#
+# `sync` turns on the y-sync protocol and the awareness (presence) protocol, so
+# this crate speaks the same wire format as the Yjs ecosystem and can talk to an
+# unmodified y-websocket/Hocuspocus relay.
+#
+# NOTE the indexing invariant CHANGED with this swap. automerge indexed Text in
+# Unicode scalars, identical to ropey's chars, so offsets crossed the boundary
+# untouched. yrs offers only UTF-8 bytes or UTF-16 code units, so the collab
+# crate converts at its boundary and pins the new invariant with its own test.
+yrs = { version = "0.27", features = ["sync"] }
 
 thiserror = "1"
 
