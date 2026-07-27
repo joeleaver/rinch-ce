@@ -1,0 +1,72 @@
+[package]
+name = "rinch-code-editor-web"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Browser host for the code-editor component: the same CodeEditor the desktop demo mounts, projected onto the DOM by rinch-web"
+
+# Excluded from the rinch-ce workspace (see the root manifest). A web demo needs
+# its own Cargo.lock and its own patch table: it must NOT inherit the desktop
+# wgpu/winit forks, and it DOES need the tree-sitter ones, because grammars are
+# the only dependency here that compiles C.
+[dependencies]
+# rinch with no backend, plus the browser-native DOM backend. The mirror image of
+# the desktop demo, which names `desktop` instead — the editor library itself
+# names neither. `components`/`theme` are what rinch-web's `mount` wants.
+rinch = { path = "../../../rinch/crates/rinch", default-features = false, features = [
+    "components",
+    "theme",
+] }
+rinch-core = { path = "../../../rinch/crates/rinch-core", features = ["theme"] }
+rinch-web = { path = "../../../rinch/crates/rinch-web" }
+
+# The component under test, with the Rust grammar compiled in — the same feature
+# the desktop demo picks, so the two demos are comparable line for line.
+rinch-code-editor = { path = "../../crates/rinch-code-editor", features = [
+    "lang-rust",
+] }
+
+# WASM bindings and console glue.
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+console_log = "0.2"
+log = "0.4"
+
+# The grammar forks add the wasm32-unknown-unknown header path that
+# tree-sitter-language publishes but the grammars never read. Without these the
+# C compile fails outright on wasm32; they are not an optimization. Kept in sync
+# with the root manifest by hand — the two tables cannot share a definition
+# because this package is deliberately outside that workspace. These retire as
+# the upstream PRs merge.
+#
+# The desktop wgpu/winit forks are deliberately ABSENT: nothing here links a
+# renderer, and patching them in would drag the desktop backend into a wasm
+# build.
+#
+# Every build prints "patch ... was not used in the crate graph" for the seven
+# grammars `lang-rust` does not pull in. That warning is EXPECTED and is the
+# cheap side of the trade: listing them all means flipping to another `lang-*`
+# feature just works, where listing only the enabled one would fail with an
+# obscure C compile error about a missing header.
+[patch.crates-io]
+tree-sitter-rust = { git = "https://github.com/joeleaver/tree-sitter-rust", branch = "wasm32-sysroot" }
+tree-sitter-typescript = { git = "https://github.com/joeleaver/tree-sitter-typescript", branch = "wasm32-sysroot" }
+tree-sitter-javascript = { git = "https://github.com/joeleaver/tree-sitter-javascript", branch = "wasm32-sysroot" }
+tree-sitter-json = { git = "https://github.com/joeleaver/tree-sitter-json", branch = "wasm32-sysroot" }
+tree-sitter-yaml = { git = "https://github.com/joeleaver/tree-sitter-yaml", branch = "wasm32-sysroot" }
+# Repo name differs from crate name for these two.
+tree-sitter-toml-ng = { git = "https://github.com/joeleaver/tree-sitter-toml", branch = "wasm32-sysroot" }
+tree-sitter-md = { git = "https://github.com/joeleaver/tree-sitter-markdown", branch = "wasm32-sysroot" }
+# HTML additionally needed strncpy/towupper replaced; the freestanding headers
+# provide neither.
+tree-sitter-html = { git = "https://github.com/joeleaver/tree-sitter-html", branch = "wasm32-sysroot" }
+# tree-sitter-css needs no fork -- it already builds for wasm32 unmodified.
+
+# Debug wasm is otherwise slow enough to muddy any judgement about the editor's
+# own responsiveness, and the dependencies are the bulk of the code.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

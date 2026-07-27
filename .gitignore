@@ -16,6 +16,8 @@
 .claude/*
 !.claude/settings.json
 .mcp.json
+# Browser-automation scratch output (screenshots, page snapshots, console logs)
+.playwright-mcp/
 
 # OS
 .DS_Store

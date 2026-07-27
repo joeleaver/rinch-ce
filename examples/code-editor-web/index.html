@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rinch-ce code editor on the web</title>
+    <style>
+        /* The editor is a fixed-height, internally-scrolling component: it
+           virtualizes against its own scroll container's measured height, and
+           reveals the caret by scrolling that container. So the whole chain
+           from <html> down to the host div must carry a definite height.
+
+           `#rinch-root` / `#rinch-body` are the two wrappers rinch-web's
+           `mount` inserts between <body> and the app's own tree. They are
+           part of its documented contract (see `web_document.rs`), and they
+           are the easiest thing in the world to forget, because leaving them
+           out fails *silently and plausibly*: percentage height stops
+           resolving, the editor grows to its full content height instead, its
+           overflow:auto container has nothing to scroll, and the page scrolls
+           in its place. Everything still looks right in a screenshot — but
+           every line in the document is materialized, which is precisely what
+           the virtualization exists to prevent. */
+        html, body, #rinch-root, #rinch-body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        body { background: #131313; }
+    </style>
+    <link data-trunk rel="rust" />
+</head>
+<body></body>
+</html>
