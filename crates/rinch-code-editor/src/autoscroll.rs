@@ -211,7 +211,7 @@ impl AutoScroll {
         // scroll-only tick needs none — the rows and gutter re-derive from
         // `scroll_top` alone, and skipping it halves the subscriber flushes.
         if moved {
-            self.ctx.version.update(|v| *v = v.wrapping_add(1));
+            self.ctx.bump();
         }
         if moved || new_st != st {
             (self.ctx.blink_restart)();

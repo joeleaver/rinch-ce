@@ -1,10 +1,10 @@
 //! Keyboard input: turning key events into model operations.
 //!
-//! rinch routes keys through a single global interceptor rather than per-element
-//! `onkeydown`, so [`install`] registers one closure that owns a handle to the
-//! model. It is gated on a focus flag the component sets when the editor is
-//! clicked, so keystrokes only reach the document while the editor has focus and
-//! otherwise fall through to the runtime untouched.
+//! rinch routes keys through a single *process-wide* interceptor rather than
+//! per-element `onkeydown`, so the interceptor itself does not live here — it
+//! lives in [`mod@crate::focus`], which owns the registry of mounted editors and
+//! decides which one a key belongs to. This module is what happens once that
+//! decision is made: [`handle_key`] drives one editor's model.
 //!
 //! The mapping in [`apply`] is intentionally small and Monaco-shaped: arrows and
 //! their Ctrl/Shift variants move or extend, the edit keys insert and delete,
@@ -18,11 +18,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rinch::core::{KeyEventData, Memo, NodeHandle, Signal, set_keyboard_interceptor};
+use rinch::core::{KeyEventData, Memo, NodeHandle, Signal};
 use rinch_code_editor_model::{EditorModel, Grid, Motion, Selection, Selections};
 
 use crate::autoscroll::AutoScroll;
 use crate::clipboard;
+use crate::focus::{self, EditorId};
 use crate::mouse::{ClickCounter, GestureStart};
 use crate::styles::LINE_HEIGHT;
 
@@ -46,6 +47,9 @@ const FALLBACK_PAGE_LINES: usize = 20;
 /// runs).
 #[derive(Clone)]
 pub(crate) struct InputCtx {
+    /// Which editor this is, among all the ones mounted. Needed so a press can
+    /// claim the keyboard away from its siblings — see [`mod@crate::focus`].
+    pub id: EditorId,
     pub model: Rc<RefCell<EditorModel>>,
     pub grid: Grid,
     pub version: Signal<u64>,
@@ -68,44 +72,73 @@ pub(crate) struct InputCtx {
     /// and the component's unmount cleanup can stop it; `on_end` alone cannot
     /// be relied on (rinch's `Drag::cancel` drops it unfired).
     pub scroller: Rc<RefCell<Option<Rc<AutoScroll>>>>,
+    /// Told after anything that changes the document or the selection, and
+    /// after this editor gains or loses focus. The component points it at the
+    /// `on_change` prop; a collaborative embedder is what listens.
+    pub on_change: Rc<dyn Fn()>,
 }
 
-/// Install the global keyboard interceptor. It drives the model, bumps the
-/// version so the reactive render repaints, and does nothing unless `focused`
-/// is set.
-pub(crate) fn install(ctx: InputCtx) {
-    set_keyboard_interceptor(move |ev| {
-        if !ctx.focused.get() {
-            return false;
+impl InputCtx {
+    /// Announce that the document or the selection moved: repaint, then tell
+    /// anyone listening.
+    ///
+    /// Every input path goes through here rather than bumping `version`
+    /// itself. That is what keeps the two things that must happen on a change
+    /// from drifting apart — and they had drifted: the drag auto-scroll tick
+    /// bumped the version without running `after_op`, which was harmless while
+    /// the only listener was the caret-reveal (which auto-scroll must *not*
+    /// do), and stops being harmless the moment a collaborator is waiting to
+    /// hear where this caret went.
+    pub fn bump(&self) {
+        self.version.update(|v| *v = v.wrapping_add(1));
+        self.notify();
+    }
+
+    /// Tell the listener something changed, without repainting.
+    ///
+    /// Focus changes come through here: gaining or losing the keyboard alters
+    /// nothing the version drives (the caret reads the focus signal directly),
+    /// but it does change whether this editor has a caret worth publishing.
+    pub fn notify(&self) {
+        (self.on_change)();
+    }
+
+    /// Claim the keyboard for this editor, taking it from any sibling.
+    pub fn take_focus(&self) {
+        focus::focus(self.id);
+    }
+}
+
+/// Drive one editor from one key event. Called by the shared interceptor in
+/// [`mod@crate::focus`], which has already decided this editor owns the key.
+pub(crate) fn handle_key(ctx: &InputCtx, ev: &KeyEventData) -> bool {
+    // A page is the count of fully visible lines, measured fresh each press
+    // so it tracks the window size for free (Monaco's pageSize).
+    let page_lines = {
+        let lines = (ctx.view.client_height() as f32 / LINE_HEIGHT) as usize;
+        if lines > 0 {
+            lines
+        } else {
+            FALLBACK_PAGE_LINES
         }
-        // A page is the count of fully visible lines, measured fresh each press
-        // so it tracks the window size for free (Monaco's pageSize).
-        let page_lines = {
-            let lines = (ctx.view.client_height() as f32 / LINE_HEIGHT) as usize;
-            if lines > 0 {
-                lines
-            } else {
-                FALLBACK_PAGE_LINES
+    };
+    // Confine the model borrow to this block. Bumping `version` below runs
+    // the reactive render effects synchronously, and those read the model —
+    // so its borrow must be released first, or they panic on a double borrow.
+    let outcome = {
+        let mut m = ctx.model.borrow_mut();
+        apply(&mut m, &ctx.grid, ev, page_lines)
+    };
+    match outcome {
+        None => false,
+        Some(changed) => {
+            if changed {
+                ctx.bump();
+                (ctx.after_op)();
             }
-        };
-        // Confine the model borrow to this block. Bumping `version` below runs
-        // the reactive render effects synchronously, and those read the model —
-        // so its borrow must be released first, or they panic on a double borrow.
-        let outcome = {
-            let mut m = ctx.model.borrow_mut();
-            apply(&mut m, &ctx.grid, ev, page_lines)
-        };
-        match outcome {
-            None => false,
-            Some(changed) => {
-                if changed {
-                    ctx.version.update(|v| *v = v.wrapping_add(1));
-                    (ctx.after_op)();
-                }
-                true
-            }
+            true
         }
-    });
+    }
 }
 
 /// Map one key event to a model operation. `None` means the editor does not

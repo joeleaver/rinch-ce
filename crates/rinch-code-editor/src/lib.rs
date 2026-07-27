@@ -44,10 +44,39 @@
 //!   front, the name chip up for a moment after they move. Where the presence
 //!   comes from is not this crate's business: it takes plain
 //!   [`RemotePresence`]es and never mentions a network. See [`mod@presence`].
+//! - **Being** a collaborator. An [`EditorHandle`] passed as the `handle` prop
+//!   lets an embedder replay a peer's edits into this document and collect this
+//!   editor's own for publication, and `on_change` tells it when to. The
+//!   collaboration crate is not a dependency of this one and never will be —
+//!   the application is the only place that names both. See [`mod@handle`].
+//!
+//! # More than one editor
+//!
+//! Several `CodeEditor`s can share a window. rinch routes keys through one
+//! process-wide interceptor, so the editors keep a registry and arbitrate the
+//! keyboard among themselves; clicking one takes focus from the others, and an
+//! editor that loses focus withdraws its caret from any collaborative session.
+//! [`mod@focus`] documents the mechanism and, more importantly, the three things
+//! it still cannot do: blur when a click lands outside every editor (wire
+//! [`blur_all`] if that matters to you), blur when the OS window loses focus,
+//! and let a rinch `<input>` receive keys while an editor is focused.
+//!
+//! Two further constraints worth stating rather than discovering:
+//!
+//! - **One [`EditorHandle`] per mounted editor.** A handle is a live connection
+//!   to one document, and attaching one to two editors would leave the first
+//!   silently orphaned. Same rule as rinch's own editor, and as y-monaco's.
+//! - **Per-instance teardown needs a control-flow boundary.** rinch gives a
+//!   component its own scope — and therefore its own cleanup — only inside a
+//!   `Show`, a `for`, or an `if`. Mounted statically, an editor's cleanups land
+//!   on its parent's list and run when the *parent* goes, which is fine when
+//!   editors live as long as the window and not fine when they come and go.
 
 mod autoscroll;
 mod blink;
 mod clipboard;
+mod focus;
+mod handle;
 mod highlight;
 mod input;
 mod mouse;
@@ -55,6 +84,7 @@ mod presence;
 mod render;
 mod scroll;
 mod styles;
+mod view_state;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -62,11 +92,16 @@ use std::rc::Rc;
 use rinch::prelude::*;
 use rinch_code_editor_model::{EditorModel, Grid};
 
-/// How a collaborator is described to the editor, and the two types it is built
-/// from. Re-exported so an embedder needs only this crate to feed presence in —
-/// mapping its own peer type (a `rinch_code_editor_collab::Peer`, or anything
-/// else) into these.
-pub use rinch_code_editor_model::{RemotePresence, Rgba, Selection};
+pub use focus::blur_all;
+pub use handle::EditorHandle;
+
+/// How a collaborator is described to the editor, and the types an embedder
+/// needs to talk to it. Re-exported so wiring a collaborative session needs
+/// only this crate on the view side — mapping its own peer type (a
+/// `rinch_code_editor_collab::Peer`, or anything else) into a
+/// [`RemotePresence`], and passing [`Change`]s and [`Splice`]s across through
+/// an [`EditorHandle`].
+pub use rinch_code_editor_model::{Change, RemotePresence, Rgba, Selection, Splice};
 
 // Imported by name, not called through `render::`: the rsx `for` macro captures
 // and clones the idents its iterator expression names, and a module path is not
@@ -74,11 +109,11 @@ pub use rinch_code_editor_model::{RemotePresence, Rgba, Selection};
 use presence::{ChipClock, remote_carets, remote_chips, remote_dots, remote_rects};
 use render::{gutter_rows, selection_rects, text_rows};
 use styles::{
-    EDITOR_STYLE, FALLBACK_CELL_WIDTH, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, TAB_SIZE, VIEW_STYLE,
-    caret_style, current_line_style, gutter_scroll_style, gutter_style, layers_style, line_style,
-    number_style, remote_caret_style, remote_chip_style, remote_dot_style, remote_sel_rect_style,
-    sel_rect_style,
+    EDITOR_STYLE, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, TAB_SIZE, VIEW_STYLE, caret_style,
+    current_line_style, gutter_scroll_style, gutter_style, layers_style, line_style, number_style,
+    remote_caret_style, remote_chip_style, remote_dot_style, remote_sel_rect_style, sel_rect_style,
 };
+use view_state::ViewState;
 
 /// Extra lines rendered above and below the viewport so a fast scroll does not
 /// flash blank rows before the next frame materializes them.
@@ -102,12 +137,27 @@ const FALLBACK_VIEWPORT_H: f32 = 1200.0;
 /// Pass the signal *itself*, never a closure producing one: a closure-valued
 /// prop makes rinch treat the whole component as reactive and rebuild its entire
 /// subtree on every presence update.
+///
+/// `on_change` fires after anything that moves the document or the selection,
+/// and after this editor gains or loses the keyboard. Monaco splits this into
+/// `onDidChangeModelContent` and `onDidChangeCursorSelection`; one event is
+/// enough here because a collaborative embedder's response to both is the same
+/// — drain the pending changes (often none), republish the caret, pump. The
+/// prop name must keep its `on_` prefix: rinch treats other closure-valued
+/// props as making the whole component reactive, which would rebuild its
+/// subtree on every keystroke.
 #[component]
 pub fn CodeEditor(
     text: String,
     language: String,
     peers: Signal<Vec<RemotePresence>>,
+    on_change: Callback,
+    handle: Option<EditorHandle>,
 ) -> NodeHandle {
+    // This editor's identity among all the mounted ones, taken before the input
+    // context that carries it. See [`mod@focus`] for what it is for.
+    let editor_id = focus::EditorId::next();
+
     // Build the theme, read the default foreground off it (the fallback colour for
     // an unstyled token), then hand the theme to the highlighter it colours through.
     let theme = highlight::dark_theme();
@@ -194,79 +244,26 @@ pub fn CodeEditor(
     let probe_text = __scope.create_text(&"0".repeat(PROBE_LEN));
     probe.append_child(&probe_text);
 
-    // Derived overlay state, as memos. Each captures the model (or the probe)
-    // *once* and recomputes when `version` bumps; the style closures below then
-    // read them — a `Memo` is `Copy`, so nothing non-`Copy` is moved inside an
-    // effect the macro re-evaluates on every run (a plain model or node handle
-    // would not survive that). The `for` loops, by contrast, capture the model
-    // once and only borrow it, so they reference `model` directly and the macro
-    // clones it per loop.
-    //
-    // `cell_w` measures the probe *synchronously* (`client_width`) rather than
-    // subscribing to its `bounds_signal`. That is deliberate and load-bearing: a
-    // bounds-signal subscriber re-runs during paint, inside the document's read
-    // borrow (see rinch's `update_bounds_signals`), and setting a style attribute
-    // there re-enters the borrow and panics. Keying the measurement on `version`
-    // instead means it only re-runs from the keyboard path, where the document is
-    // free — and the probe's width does not depend on the document anyway, so
-    // measuring it on edits (not on every layout) loses nothing. Before the first
-    // layout `client_width` is 0 and the fallback stands in; the caret sits at
-    // column 0 then, where the cell width does not matter.
-    let cell_w = Memo::new({
-        let p = probe.clone();
-        move || {
-            version.get();
-            let w = p.client_width() as f32;
-            if w > 0.0 {
-                w / PROBE_LEN as f32
-            } else {
-                FALLBACK_CELL_WIDTH
-            }
-        }
-    });
-    let content_h = Memo::new({
-        let m = model.clone();
-        move || {
-            version.get();
-            render::content_height(&m.borrow())
-        }
-    });
-    let current_line = Memo::new({
-        let m = model.clone();
-        move || {
-            version.get();
-            render::caret_line(&m.borrow())
-        }
-    });
-    let caret = Memo::new({
-        let m = model.clone();
-        move || {
-            version.get();
-            render::caret_grid(&m.borrow(), &grid)
-        }
-    });
-
-    // The visible line window: the slice of lines the rows below materialize.
-    // Recomputes on edit (`version`) and on scroll (`scroll_top`), measuring the
-    // viewport height synchronously — the same reason `cell_w` does, and the same
-    // pattern rinch's own `virtual_list` uses. Before the first layout the height
-    // is 0, so the fallback governs the first frame only.
-    let visible = Memo::new({
-        let m = model.clone();
-        let vh = view.clone();
-        move || {
-            version.get();
-            let st = scroll_top.get() as f32;
-            let total = m.borrow().len_lines();
-            let measured = vh.client_height() as f32;
-            let viewport = if measured > 1.0 {
-                measured
-            } else {
-                FALLBACK_VIEWPORT_H
-            };
-            grid.visible_lines(st, viewport, total, OVERSCAN)
-        }
-    });
+    // Everything the render derives from the document and the scroll position,
+    // as memos: the measured cell advance, the document height, the caret, and
+    // the visible line window. Destructured into locals because the rsx block
+    // below reads them by name from inside reactive closures — see
+    // [`mod@view_state`] for why each is a `Memo` and why two of the
+    // measurements are taken synchronously.
+    let ViewState {
+        cell_w,
+        content_h,
+        current_line,
+        caret,
+        visible,
+    } = ViewState::new(
+        &model,
+        grid,
+        version,
+        scroll_top,
+        probe.clone(),
+        view.clone(),
+    );
 
     // The input surfaces, wired to one shared context: the global keyboard
     // interceptor, and mouse placement/drag selection on the layer stack. The
@@ -277,6 +274,7 @@ pub fn CodeEditor(
     // *nearest* ancestor carrying the attribute, that handler shadows the editor
     // root's focus-only one everywhere in the text area, so it takes focus too.
     let input_ctx = input::InputCtx {
+        id: editor_id,
         model: model.clone(),
         grid,
         version,
@@ -292,6 +290,7 @@ pub fn CodeEditor(
         clicks: Rc::new(RefCell::new(mouse::ClickCounter::new())),
         gesture: Rc::new(RefCell::new(None)),
         scroller: Rc::new(RefCell::new(None)),
+        on_change: Rc::new(move || on_change.invoke()),
     };
     // A drag's auto-scroll timer must not outlive the component either.
     __scope.on_cleanup({
@@ -302,7 +301,20 @@ pub fn CodeEditor(
             }
         }
     });
-    input::install(input_ctx.clone());
+    // Join the registry that owns the one process-wide key interceptor, and
+    // leave it on unmount — an entry left behind would keep this editor's model
+    // alive and keep feeding it keystrokes after it left the screen.
+    focus::register(editor_id, input_ctx.clone());
+    __scope.on_cleanup(move || focus::deregister(editor_id));
+
+    // If the embedder brought a handle, fill it in: from here it can replay a
+    // collaborator's edits into this document and collect ours for publication.
+    // Holding a handle is also what turns local-change recording on, so an
+    // editor nobody is collaborating through pays nothing for the feature.
+    if let Some(handle) = handle {
+        handle.attach(model.clone(), version, focused);
+        __scope.on_cleanup(move || handle.detach());
+    }
     let on_text_mousedown = mouse::text_mousedown(input_ctx);
 
     // The caret's style closure reads these two `Copy` signals — never the
@@ -458,7 +470,7 @@ pub fn CodeEditor(
             onmousedown: {
                 let blinker = blinker.clone();
                 move || {
-                    focused.set(true);
+                    focus::focus(editor_id);
                     blinker.restart();
                 }
             },

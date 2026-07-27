@@ -12,3 +12,8 @@ rinch = { workspace = true, features = ["desktop", "debug"] }
 # The sample document is Rust, so the consumer compiles the Rust grammar in. This
 # is the only place a language is chosen — the library ships none by default.
 rinch-code-editor = { workspace = true, features = ["lang-rust"] }
+# The collaboration layer, used only by the `collab-demo` binary. It belongs
+# here rather than in the editor crate on purpose: the editor renders presence
+# and replays edits, and knows nothing about CRDTs — the application is the one
+# place that names both halves. This dependency is the proof of that split.
+rinch-code-editor-collab.workspace = true

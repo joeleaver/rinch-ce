@@ -196,8 +196,10 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
     move || {
         // Take focus and arm the blink *before* the early returns below: a
         // right-click or a scrollbar grab focuses the editor too, and a
-        // focused caret with no blink timer would sit solid forever.
-        ctx.focused.set(true);
+        // focused caret with no blink timer would sit solid forever. Claiming
+        // focus takes it from any sibling editor, which is also how that
+        // sibling learns it has been left.
+        ctx.take_focus();
         (ctx.blink_restart)();
         let click = get_click_context();
         if click.button != MouseButton::Left {
@@ -277,7 +279,7 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                         primary: (0, end),
                     });
                     drop(m);
-                    ctx.version.update(|v| *v = v.wrapping_add(1));
+                    ctx.bump();
                     (ctx.after_op)();
                     return;
                 }
@@ -296,7 +298,7 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         // Repaint unconditionally: even a press on the caret's own cell can
         // collapse a selection or a multi-cursor set, and a redundant repaint of
         // an unchanged frame is cheap next to detecting one.
-        ctx.version.update(|v| *v = v.wrapping_add(1));
+        ctx.bump();
         (ctx.after_op)();
 
         // Capture the pointer for the selection drag. Every mode extends from
@@ -354,7 +356,7 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                     }
                 };
                 if changed {
-                    drag.version.update(|v| *v = v.wrapping_add(1));
+                    drag.bump();
                     (drag.after_op)();
                 }
             })
