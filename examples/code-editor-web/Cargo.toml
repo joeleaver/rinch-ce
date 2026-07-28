@@ -15,18 +15,19 @@ description = "Browser host for the code-editor component: the same CodeEditor t
 # the desktop demo, which names `desktop` instead — the editor library itself
 # names neither. `components`/`theme` are what rinch-web's `mount` wants.
 #
-# Same pinned rev as the workspace root — this example is outside the workspace
-# and carries its own lockfile, so the pin has to be repeated here. Keep the two
-# in step; a mismatch means two different rinch instances and the type-identity
-# failure the editor crate's README warns about.
-rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", default-features = false, features = [
+# Same source as the workspace root — `main` — repeated because this example is
+# outside the workspace and carries its own lockfile. Keep the two in step; a
+# mismatch means two different rinch instances and the type-identity failure the
+# editor crate's README warns about. Since both track a branch, that also means
+# `cargo update` here and at the root should happen together.
+rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", default-features = false, features = [
     "components",
     "theme",
 ] }
-rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", features = [
+rinch-core = { git = "https://github.com/joeleaver/rinch", branch = "main", features = [
     "theme",
 ] }
-rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6" }
+rinch-web = { git = "https://github.com/joeleaver/rinch", branch = "main" }
 
 # The component under test, with the Rust grammar compiled in — the same feature
 # the desktop demo picks, so the two demos are comparable line for line.

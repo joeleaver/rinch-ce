@@ -31,16 +31,19 @@ rinch-code-editor-syntax = { path = "crates/rinch-code-editor-syntax" }
 rinch-code-editor-model = { path = "crates/rinch-code-editor-model" }
 rinch-code-editor-collab = { path = "crates/rinch-code-editor-collab" }
 
-# Rinch, by git rev.
+# Rinch, tracking `main`.
 #
 # NOT a path dependency on a sibling checkout, which is what this used to be:
 # that made the workspace unbuildable for anyone who had not also cloned rinch
-# next to it, which is to say unconsumable. rinch is not on crates.io, so a
-# pinned git rev is the closest thing to a real dependency available.
+# next to it, which is to say unconsumable. rinch is not on crates.io, so git is
+# the closest thing to a real dependency available.
 #
-# Pinned to an exact rev rather than tracking `main`, so a build is reproducible
-# and rinch never changes underneath this workspace without someone deciding to
-# let it. Bump deliberately, and re-run the suite when you do.
+# Deliberately a branch and not a rev: this editor is developed alongside rinch
+# and is meant to follow it. `Cargo.lock` still records the exact commit, so a
+# build here is reproducible until someone runs `cargo update` — but note that a
+# *consumer* of this crate does not use our lockfile, so an application pulling
+# `rinch-code-editor` from git resolves rinch to whatever `main` is that day. If
+# a release ever needs to stand still, pin the rev then.
 #
 # To build against a local rinch working tree instead — testing an unmerged
 # rinch branch, say — use a `[patch]` in `.cargo/config.toml`; that file is
@@ -52,8 +55,8 @@ rinch-code-editor-collab = { path = "crates/rinch-code-editor-collab" }
 # forked wgpu/winit out of a library consumer's tree entirely — they sit behind
 # rinch's `desktop`/`gpu` features, so only an application that turns one on
 # needs the `[patch.crates-io]` block below.
-rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", default-features = false }
-rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6" }
+rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", default-features = false }
+rinch-core = { git = "https://github.com/joeleaver/rinch", branch = "main" }
 
 # Text storage. char- AND line-indexed, no_std-friendly, wasm-clean.
 # char indexing matches automerge's codepoint-indexed Text exactly, so the

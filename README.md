@@ -27,9 +27,10 @@ cd rinch-ce
 cargo build --release
 ```
 
-That is the whole of it. `rinch` is not on crates.io, so it comes from git at a
-pinned rev, as do the forked `wgpu`/`winit` that rinch's desktop backend needs
-and the forked tree-sitter grammars — Cargo fetches all of them.
+That is the whole of it. `rinch` is not on crates.io, so it comes from git —
+tracking `main`, since this editor is developed alongside it — as do the forked
+`wgpu`/`winit` that rinch's desktop backend needs and the forked tree-sitter
+grammars. Cargo fetches all of them.
 
 **Build in release.** Debug builds are usable but slow enough to change how the
 editor feels, and the test suite runs in seconds under `--release` versus
@@ -37,17 +38,18 @@ minutes without it.
 
 ### Using it in your own application
 
-Add the editor and the same rinch revision it was built against:
+Add the editor and rinch from the same source it tracks:
 
 ```toml
 [dependencies]
 rinch-code-editor = { git = "https://github.com/joeleaver/rinch-ce" }
-rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70e", features = ["desktop"] }
+rinch = { git = "https://github.com/joeleaver/rinch", branch = "main", features = ["desktop"] }
 ```
 
 Your application and this crate **must resolve to the same `rinch`** — same
-source, same rev — or Cargo treats them as two different crates and a
-`rinch::Signal` from one is not the same type as from the other. If you see
+source, same commit — or Cargo treats them as two different crates and a
+`rinch::Signal` from one is not the same type as from the other. Matching
+`branch = "main"` is what makes Cargo unify them into one. If you see
 mismatched-type errors, run `cargo tree -d rinch`. See
 [`crates/rinch-code-editor/README.md`](crates/rinch-code-editor/README.md) for
 the full explanation of why rinch is a peer dependency.
