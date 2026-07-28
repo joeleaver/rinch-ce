@@ -19,27 +19,59 @@ fn App() -> NodeHandle {
 }
 ```
 
-## Building this requires rinch checked out beside it
+## Building
 
-`rinch` is a **path dependency on a sibling directory**, not a published crate,
-so cloning this repo on its own is not enough. Lay the two out like this:
-
-```
-some-dir/
-├── rinch/      # git clone https://github.com/joeleaver/rinch
-└── rinch-ce/   # git clone https://github.com/joeleaver/rinch-ce
+```sh
+git clone https://github.com/joeleaver/rinch-ce
+cd rinch-ce
+cargo build --release
 ```
 
-Then `cargo build --release` from `rinch-ce/`. If Cargo complains that it cannot
-find `../rinch/crates/rinch`, this is why.
-
-Everything else resolves normally: the forked `wgpu`/`winit` that rinch's
-desktop backend needs, and the forked tree-sitter grammars, are all git
-dependencies in `Cargo.toml` and fetch themselves.
+That is the whole of it. `rinch` is not on crates.io, so it comes from git at a
+pinned rev, as do the forked `wgpu`/`winit` that rinch's desktop backend needs
+and the forked tree-sitter grammars — Cargo fetches all of them.
 
 **Build in release.** Debug builds are usable but slow enough to change how the
 editor feels, and the test suite runs in seconds under `--release` versus
 minutes without it.
+
+### Using it in your own application
+
+Add the editor and the same rinch revision it was built against:
+
+```toml
+[dependencies]
+rinch-code-editor = { git = "https://github.com/joeleaver/rinch-ce" }
+rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70e", features = ["desktop"] }
+```
+
+Your application and this crate **must resolve to the same `rinch`** — same
+source, same rev — or Cargo treats them as two different crates and a
+`rinch::Signal` from one is not the same type as from the other. If you see
+mismatched-type errors, run `cargo tree -d rinch`. See
+[`crates/rinch-code-editor/README.md`](crates/rinch-code-editor/README.md) for
+the full explanation of why rinch is a peer dependency.
+
+A desktop application additionally needs rinch's `[patch.crates-io]` block for
+its forked `wgpu`/`winit`, because a `[patch]` only takes effect from the
+top-level workspace. Copy the block from this repo's `Cargo.toml`. A library
+that leaves rinch on `default-features = false` needs none of it — the forks sit
+behind rinch's `desktop`/`gpu` features.
+
+### Building against a local rinch checkout
+
+To test an unmerged rinch branch without editing the manifest, drop this in
+`.cargo/config.toml` (gitignored):
+
+```toml
+[patch."https://github.com/joeleaver/rinch"]
+rinch = { path = "../rinch/crates/rinch" }
+rinch-core = { path = "../rinch/crates/rinch-core" }
+```
+
+Delete it to go back to the pinned rev. Please don't turn the manifest entries
+back into path dependencies — that is what made this repo unbuildable for
+anyone who had not also cloned rinch beside it.
 
 ## Layout
 

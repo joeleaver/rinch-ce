@@ -31,11 +31,29 @@ rinch-code-editor-syntax = { path = "crates/rinch-code-editor-syntax" }
 rinch-code-editor-model = { path = "crates/rinch-code-editor-model" }
 rinch-code-editor-collab = { path = "crates/rinch-code-editor-collab" }
 
-# Rinch (path dependency on the sibling checkout).
+# Rinch, by git rev.
+#
+# NOT a path dependency on a sibling checkout, which is what this used to be:
+# that made the workspace unbuildable for anyone who had not also cloned rinch
+# next to it, which is to say unconsumable. rinch is not on crates.io, so a
+# pinned git rev is the closest thing to a real dependency available.
+#
+# Pinned to an exact rev rather than tracking `main`, so a build is reproducible
+# and rinch never changes underneath this workspace without someone deciding to
+# let it. Bump deliberately, and re-run the suite when you do.
+#
+# To build against a local rinch working tree instead — testing an unmerged
+# rinch branch, say — use a `[patch]` in `.cargo/config.toml`; that file is
+# gitignored and the README has the snippet. Do not turn these back into path
+# dependencies.
+#
 # `default-features = false` mirrors rinch's own workspace: "desktop" is never
-# implicit and must be named explicitly by consumers.
-rinch = { path = "../rinch/crates/rinch", default-features = false }
-rinch-core = { path = "../rinch/crates/rinch-core" }
+# implicit and must be named explicitly by consumers. It is also what keeps the
+# forked wgpu/winit out of a library consumer's tree entirely — they sit behind
+# rinch's `desktop`/`gpu` features, so only an application that turns one on
+# needs the `[patch.crates-io]` block below.
+rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", default-features = false }
+rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6" }
 
 # Text storage. char- AND line-indexed, no_std-friendly, wasm-clean.
 # char indexing matches automerge's codepoint-indexed Text exactly, so the

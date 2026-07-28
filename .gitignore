@@ -6,6 +6,11 @@
 # Rust
 **/*.rs.bk
 
+# Local build overrides — e.g. a [patch] pointing rinch at a sibling checkout.
+# Deliberately not committed: the manifest's pinned git rev is what everyone
+# else builds against. See the README.
+.cargo/config.toml
+
 # IDE
 .idea/
 .vscode/

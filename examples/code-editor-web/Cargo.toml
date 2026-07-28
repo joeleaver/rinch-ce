@@ -14,12 +14,19 @@ description = "Browser host for the code-editor component: the same CodeEditor t
 # rinch with no backend, plus the browser-native DOM backend. The mirror image of
 # the desktop demo, which names `desktop` instead — the editor library itself
 # names neither. `components`/`theme` are what rinch-web's `mount` wants.
-rinch = { path = "../../../rinch/crates/rinch", default-features = false, features = [
+#
+# Same pinned rev as the workspace root — this example is outside the workspace
+# and carries its own lockfile, so the pin has to be repeated here. Keep the two
+# in step; a mismatch means two different rinch instances and the type-identity
+# failure the editor crate's README warns about.
+rinch = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", default-features = false, features = [
     "components",
     "theme",
 ] }
-rinch-core = { path = "../../../rinch/crates/rinch-core", features = ["theme"] }
-rinch-web = { path = "../../../rinch/crates/rinch-web" }
+rinch-core = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6", features = [
+    "theme",
+] }
+rinch-web = { git = "https://github.com/joeleaver/rinch", rev = "1d2b70eb9796158c1374beb5b358ff993285cec6" }
 
 # The component under test, with the Rust grammar compiled in — the same feature
 # the desktop demo picks, so the two demos are comparable line for line.

@@ -3098,6 +3098,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "rinch"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "base64",
  "bytemuck",
@@ -3129,6 +3130,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "android-activity",
  "base64",
@@ -3140,6 +3142,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "arboard",
  "js-sys",
@@ -3237,6 +3240,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -3246,6 +3250,7 @@ dependencies = [
 [[package]]
 name = "rinch-debug"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3255,6 +3260,7 @@ dependencies = [
 [[package]]
 name = "rinch-dom"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -3292,10 +3298,12 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "regex",
  "thiserror 1.0.69",
@@ -3304,6 +3312,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "rinch-core",
  "rinch-editor-core",
@@ -3312,6 +3321,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3321,6 +3331,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "peniko",
  "vello",
@@ -3882,6 +3893,7 @@ checksum = "fd15301b4756455af51fda9835655e48812dd4175e80947fd5d6a4b57ee30e89"
 [[package]]
 name = "stylo_taffy"
 version = "0.2.0"
+source = "git+https://github.com/joeleaver/rinch?rev=1d2b70eb9796158c1374beb5b358ff993285cec6#1d2b70eb9796158c1374beb5b358ff993285cec6"
 dependencies = [
  "stylo",
  "stylo_atoms",
