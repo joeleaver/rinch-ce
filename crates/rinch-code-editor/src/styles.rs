@@ -30,6 +30,63 @@ pub(crate) const CARET_WIDTH: f32 = 2.0;
 pub(crate) const CHIP_HEIGHT: f32 = 16.0;
 /// Diameter of the dot capping a remote caret. Centred on the 2px bar.
 pub(crate) const DOT_SIZE: f32 = 6.0;
+/// Monaco's `stopRenderingLineAfter`: a line is drawn up to this many
+/// characters and no further, however long it really is.
+///
+/// This is the whole of Monaco's answer to long lines — it does **no**
+/// horizontal virtualization, no column windowing, nothing viewport-relative.
+/// The cap is absolute, counted from column 1, and what follows it is replaced
+/// by a "Show more" chip. Registered in VS Code's `editorOptions.ts` with no
+/// schema description, so it is an API-level performance guard rather than a
+/// user setting.
+pub(crate) const STOP_RENDERING_LINE_AFTER: usize = 10_000;
+
+/// Monaco's `scrollBeyondLastColumn`: extra cells of scrollable width past the
+/// widest line, so the last character is not jammed against the right edge.
+///
+/// Four, not five — the registered default in `editorOptions.ts` is 4, and the
+/// `IEditorOptions` JSDoc in the same file that says otherwise is stale.
+pub(crate) const SCROLL_BEYOND_LAST_COLUMN: usize = 4;
+
+/// Width of rinch's vertical scrollbar, which it paints as an **overlay** over
+/// the right edge of a scroll container whose content overflows.
+///
+/// Two things need it, both because it overlays rather than insetting: a press
+/// in that strip is a scrollbar grab and must not place a caret (rinch's own
+/// `find_scrollbar_hit` uses the same width, and dispatches `data-onmousedown`
+/// additively *before* its scrollbar logic, so stepping aside is on us — Monaco
+/// likewise never moves the cursor on a scrollbar grab); and a horizontal
+/// reveal must treat the strip as outside the viewport, or it parks the caret
+/// underneath it. Monaco subtracts its own `verticalScrollbarWidth` in exactly
+/// the same place.
+pub(crate) const SCROLLBAR_WIDTH: f32 = 16.0;
+
+/// Cells of scrollable width reserved for the "Show more" chip when a visible
+/// line is truncated.
+///
+/// An allowance, not a measurement. The chip is an inline run whose width
+/// depends on its own label ("Show more (4.9 KB)"), and the document width is
+/// computed from grid arithmetic that never looks at rendered runs. Monaco does
+/// not need this because it measures the laid-out line, chip included. Without
+/// it the chip sits just past the maximum scroll offset — visible only in part,
+/// and the one control that recovers the hidden text is the thing you cannot
+/// reach. Over-reserving costs a little empty space at the far right, exactly
+/// like [`SCROLL_BEYOND_LAST_COLUMN`].
+pub(crate) const OVERFLOW_CHIP_CELLS: usize = 24;
+
+/// Monaco's `ViewLines.HORIZONTAL_EXTRA_PX`: how far *left* of the caret a
+/// non-minimal horizontal reveal pulls the viewport, so a caret scrolled into
+/// view from the right is not pinned against the left edge.
+pub(crate) const HORIZONTAL_EXTRA_PX: f32 = 30.0;
+
+/// Monaco's `revealHorizontalRightPadding`: the matching room on the right.
+///
+/// Fifteen, not thirty — the registered default in `editorOptions.ts` is 15;
+/// the `IEditorOptions` JSDoc beside it saying 30 is stale. The asymmetry is
+/// Monaco's, and it is what makes typing towards the right edge scroll a little
+/// ahead of the caret instead of jerking a whole half-viewport.
+pub(crate) const REVEAL_HORIZONTAL_RIGHT_PADDING: f32 = 15.0;
+
 /// Characters in the measurement probe; its width / this = one cell's advance.
 pub(crate) const PROBE_LEN: usize = 10;
 /// Cell width used before the probe has been measured (roughly DejaVu Sans Mono
@@ -85,8 +142,52 @@ pub(crate) fn number_style(top: f32) -> String {
     )
 }
 
-pub(crate) fn layers_style(content_height: f32) -> String {
-    format!("position:relative; height:{content_height}px;")
+/// The layer stack: the scroll spacer, sized to the whole document.
+///
+/// Both dimensions are explicit, and the width is not cosmetic. The rows are
+/// absolutely positioned, and neither backend content-sizes a box to its
+/// absolutely-positioned children — taffy excludes them from content-based
+/// sizing, and rinch's desktop `compute_content_width` walks direct children
+/// only. Without a width the stack measures exactly as wide as the viewport,
+/// so the scroll container believes nothing overflows: no horizontal scrolling,
+/// and a trackpad swipe over the editor falls through to scrolling the page.
+///
+/// It also gives [`current_line_style`]'s `left:0; right:0` something to resolve
+/// against, so the current-line band spans the full scrollable width rather
+/// than stopping at the viewport's right edge.
+///
+/// `min-width:100%` is Monaco's `scrollWidth = max(viewportWidth, contentWidth)`
+/// expressed declaratively, and it is declarative on purpose: computing that
+/// maximum needs the viewport's width, which measures 0 until the first layout
+/// has run — so a computed floor is silently wrong on the first frame, and
+/// nothing would recompute it until the first keystroke. Letting layout resolve
+/// the percentage against the scroll container sidesteps the measurement
+/// entirely.
+pub(crate) fn layers_style(content_width: f32, content_height: f32) -> String {
+    format!(
+        "position:relative; width:{content_width}px; min-width:100%; \
+         height:{content_height}px;"
+    )
+}
+
+/// One coloured run of a line.
+pub(crate) fn seg_style(color: &str) -> String {
+    format!("color:{color}")
+}
+
+/// The chip that stands in for everything past
+/// [`STOP_RENDERING_LINE_AFTER`] — Monaco's `.mtkoverflow`, which it styles as
+/// a button because clicking it is what lifts the cap.
+///
+/// The colours are adapted rather than ported: Monaco's rule is written in
+/// terms of `--vscode-button-background` and friends, and this editor has no
+/// theme-token system to resolve those against yet. When one lands, this is a
+/// token lookup like any other.
+pub(crate) fn overflow_seg_style() -> String {
+    format!(
+        "background:#0e639c; color:#ffffff; border-radius:2px; padding:0 4px; \
+         margin-left:{TEXT_PAD_LEFT}px; cursor:pointer;"
+    )
 }
 
 pub(crate) fn line_style(top: f32) -> String {

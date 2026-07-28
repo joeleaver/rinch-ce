@@ -109,9 +109,10 @@ pub use rinch_code_editor_model::{Change, RemotePresence, Rgba, Selection, Splic
 use presence::{ChipClock, remote_carets, remote_chips, remote_dots, remote_rects};
 use render::{gutter_rows, selection_rects, text_rows};
 use styles::{
-    EDITOR_STYLE, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, TAB_SIZE, VIEW_STYLE, caret_style,
-    current_line_style, gutter_scroll_style, gutter_style, layers_style, line_style, number_style,
-    remote_caret_style, remote_chip_style, remote_dot_style, remote_sel_rect_style, sel_rect_style,
+    EDITOR_STYLE, LINE_HEIGHT, PROBE_LEN, PROBE_STYLE, STOP_RENDERING_LINE_AFTER, TAB_SIZE,
+    VIEW_STYLE, caret_style, current_line_style, gutter_scroll_style, gutter_style, layers_style,
+    line_style, number_style, remote_caret_style, remote_chip_style, remote_dot_style,
+    remote_sel_rect_style, sel_rect_style,
 };
 use view_state::ViewState;
 
@@ -184,6 +185,11 @@ pub fn CodeEditor(
     let version = Signal::new(0u64);
     let scroll_top = Signal::new(0.0_f64);
     let focused = Signal::new(false);
+    // How many characters of any one line get drawn — Monaco's
+    // `stopRenderingLineAfter`. A signal rather than a constant because
+    // clicking at or past the cap lifts it for this editor, which is the only
+    // way to reach text a capped line does not draw. `usize::MAX` is off.
+    let stop_after = Signal::new(STOP_RENDERING_LINE_AFTER);
 
     // The scroll container is built by hand (not via rsx) because the render needs
     // a handle to it — to measure its height for the visible-line window and to
@@ -194,12 +200,55 @@ pub fn CodeEditor(
     let scroll_handler = __scope.register_scroll_handler(move |st| scroll_top.set(st));
     view.set_attribute("data-onscroll", &scroll_handler.0.to_string());
 
+    // A hidden probe of known length: its measured width divided by its length is
+    // the advance of one monospace cell.
+    let probe = __scope.create_element("span");
+    probe.set_attribute("style", PROBE_STYLE);
+    let probe_text = __scope.create_text(&"0".repeat(PROBE_LEN));
+    probe.append_child(&probe_text);
+
+    // Everything the render derives from the document and the scroll position,
+    // as memos: the measured cell advance, the document's height and width, the
+    // caret, and the visible line window. Destructured into locals because the
+    // rsx block below reads them by name from inside reactive closures — see
+    // [`mod@view_state`] for why each is a `Memo` and why the measurements are
+    // taken synchronously.
+    //
+    // These come before the scroll adjustment because it reads two of them: the
+    // caret's pixel column needs the measured cell advance, and its horizontal
+    // clamp needs the document width.
+    let ViewState {
+        cell_w,
+        content_h,
+        content_w,
+        current_line,
+        caret,
+        visible,
+    } = ViewState::new(
+        &model,
+        grid,
+        version,
+        scroll_top,
+        stop_after,
+        probe.clone(),
+        view.clone(),
+    );
+
     // Reveal-and-clamp, run after every state-changing operation: bring the
-    // caret back into view, and mirror the clamp rinch's layout applies silently
-    // when the document shrinks under the viewport. It must stay a plain
-    // callback from input-handler context rather than an effect — see
-    // [`mod@scroll`] for both halves of the reasoning.
-    let reveal_and_clamp = scroll::reveal_and_clamp(view.clone(), model.clone(), grid, scroll_top);
+    // caret back into view on both axes, and mirror the clamp rinch's layout
+    // applies silently when the document shrinks under the viewport. It must
+    // stay a plain callback from input-handler context rather than an effect —
+    // see [`mod@scroll`] for that, and for why the horizontal half deliberately
+    // keeps no signal of its own.
+    let reveal_and_clamp = scroll::reveal_and_clamp(
+        view.clone(),
+        model.clone(),
+        grid,
+        cell_w,
+        scroll_top,
+        stop_after,
+        content_w,
+    );
 
     // The caret blinker: solid through activity, pulsing when idle, hidden
     // unfocused — its tick also reconciles the silent resize clamp. Restarted
@@ -229,41 +278,13 @@ pub fn CodeEditor(
     // Everything that runs after a state-changing operation, from the safe
     // input-handler context: reveal the caret and clamp the scroll, then give
     // the caret a fresh solid half-period.
-    let after_op: Rc<dyn Fn()> = Rc::new({
+    let after_op: Rc<dyn Fn(bool)> = Rc::new({
         let blinker = blinker.clone();
-        move || {
-            reveal_and_clamp();
+        move |minimal| {
+            reveal_and_clamp(minimal);
             blinker.restart();
         }
     });
-
-    // A hidden probe of known length: its measured width divided by its length is
-    // the advance of one monospace cell.
-    let probe = __scope.create_element("span");
-    probe.set_attribute("style", PROBE_STYLE);
-    let probe_text = __scope.create_text(&"0".repeat(PROBE_LEN));
-    probe.append_child(&probe_text);
-
-    // Everything the render derives from the document and the scroll position,
-    // as memos: the measured cell advance, the document height, the caret, and
-    // the visible line window. Destructured into locals because the rsx block
-    // below reads them by name from inside reactive closures — see
-    // [`mod@view_state`] for why each is a `Memo` and why two of the
-    // measurements are taken synchronously.
-    let ViewState {
-        cell_w,
-        content_h,
-        current_line,
-        caret,
-        visible,
-    } = ViewState::new(
-        &model,
-        grid,
-        version,
-        scroll_top,
-        probe.clone(),
-        view.clone(),
-    );
 
     // The input surfaces, wired to one shared context: the global keyboard
     // interceptor, and mouse placement/drag selection on the layer stack. The
@@ -280,7 +301,9 @@ pub fn CodeEditor(
         version,
         focused,
         cell_w,
+        content_w,
         scroll_top,
+        stop_after,
         view: view.clone(),
         after_op,
         blink_restart: Rc::new({
@@ -327,7 +350,7 @@ pub fn CodeEditor(
     // elements positioned in document coordinates, so native scroll places them.
     let layers = rsx! {
         div {
-            style: { move || layers_style(content_h.get()) },
+            style: { move || layers_style(content_w.get(), content_h.get()) },
             onmousedown: on_text_mousedown,
 
             // Current-line band (z 0) — full width, no measurement needed.
@@ -367,14 +390,14 @@ pub fn CodeEditor(
             }
 
             // Text rows (z 2) — visible slice only.
-            for line in text_rows(visible, &model, &default_color) {
+            for line in text_rows(visible, &model, &default_color, stop_after) {
                 div {
                     key: line.number,
                     style: line_style(line.top),
                     for seg in line.segs.clone() {
                         span {
                             key: seg.key,
-                            style: format!("color:{}", seg.color),
+                            style: seg.style.clone(),
                             { seg.text }
                         }
                     }

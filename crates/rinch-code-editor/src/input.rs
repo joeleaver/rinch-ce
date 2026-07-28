@@ -45,6 +45,13 @@ const FALLBACK_PAGE_LINES: usize = 20;
 /// effect and panics ("RefCell already borrowed"). Input-handler context is the
 /// one kind verified safe for writes that flush (it is where `version.update`
 /// runs).
+///
+/// Its `bool` is Monaco's `minimalReveal`, and it splits by *who moved the
+/// caret*: a mouse press or drag passes `true`, because you are pointing at the
+/// place and shifting the view under your finger would be wrong; the keyboard
+/// and edits pass `false` and get the horizontal padding, so typing towards the
+/// right edge scrolls a little ahead of the caret. Monaco draws the same line,
+/// in `coreCommands.ts`.
 #[derive(Clone)]
 pub(crate) struct InputCtx {
     /// Which editor this is, among all the ones mounted. Needed so a press can
@@ -55,9 +62,17 @@ pub(crate) struct InputCtx {
     pub version: Signal<u64>,
     pub focused: Signal<bool>,
     pub cell_w: Memo<f32>,
+    /// The document's scrollable width. Only the drag auto-scroller reads it —
+    /// to clamp its own horizontal scrolling, since rinch has no horizontal
+    /// layout clamp to fall back on.
+    pub content_w: Memo<f32>,
     pub scroll_top: Signal<f64>,
+    /// The live `stopRenderingLineAfter`. A press at or past it sets this to
+    /// `usize::MAX`, which is how text a capped line does not draw becomes
+    /// reachable at all.
+    pub stop_after: Signal<usize>,
     pub view: NodeHandle,
-    pub after_op: Rc<dyn Fn()>,
+    pub after_op: Rc<dyn Fn(bool)>,
     /// Restart the caret blink alone — everything `after_op` does except the
     /// caret reveal. For presses that take focus but claim nothing (a
     /// right-click), and for the auto-scroll tick, whose scrolling a reveal
@@ -134,7 +149,8 @@ pub(crate) fn handle_key(ctx: &InputCtx, ev: &KeyEventData) -> bool {
         Some(changed) => {
             if changed {
                 ctx.bump();
-                (ctx.after_op)();
+                // Keyboard and edits: the padded reveal.
+                (ctx.after_op)(false);
             }
             true
         }

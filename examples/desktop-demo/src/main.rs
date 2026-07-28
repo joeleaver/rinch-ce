@@ -72,7 +72,29 @@ fn main() {
         println!("fib({i}) = {}", fibonacci(i));
     }
 }
+
+// Lines wider than the viewport, so horizontal scrolling has something to do.
+// Press End on one to watch the caret reveal drag the view right. (line 68)
+const WIDE: &str = "the quick brown fox jumps over the lazy dog, and then keeps going well past the right-hand edge of any reasonable window, because that is the entire point of this line";
+
+fn a_long_chain(values: &[i32]) -> Vec<String> {
+    values.iter().copied().filter(|v| *v % 2 == 0).map(|v| v * 3).filter(|v| *v > 10).map(|v| format!("value {v} survived the whole chain")).collect::<Vec<_>>()
+}
 "#;
+
+/// The sample, plus one line long enough to trip `stopRenderingLineAfter`
+/// (10000 chars). Built at runtime rather than pasted in, because a literal
+/// 15000-character line in this file would be unreadable and rustfmt would
+/// fight it. It renders capped, with a "Show more" chip; clicking at or past
+/// the cap lifts it for the rest of the session.
+fn sample() -> String {
+    let mut s = String::from(SAMPLE);
+    s.push_str("\n// The next line is 15,000 characters. It draws the first 10,000. (line 74)\n");
+    s.push_str("const HUGE: &str = \"");
+    s.push_str(&"abcdefghij".repeat(1_500));
+    s.push_str("\";\n");
+    s
+}
 
 #[component]
 fn app() -> NodeHandle {
@@ -82,7 +104,7 @@ fn app() -> NodeHandle {
             div {
                 style: "width:100%; height:100%; border:1px solid #000; border-radius:6px; overflow:hidden;",
                 CodeEditor {
-                    text: SAMPLE.to_string(),
+                    text: sample(),
                     language: "rust",
                 }
             }

@@ -52,14 +52,7 @@ use web_time::Instant;
 
 use crate::autoscroll::AutoScroll;
 use crate::input::{InputCtx, select_all};
-use crate::styles::TEXT_PAD_LEFT;
-
-/// Width of the interactive strip rinch reserves at the right edge of a scroll
-/// container whose content overflows (see rinch's `find_scrollbar_hit`): a press
-/// there grabs the scrollbar, and since rinch dispatches `data-onmousedown`
-/// additively *before* the scrollbar logic, the caret handler has to step aside
-/// itself — Monaco likewise never moves the cursor on a scrollbar grab.
-const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
+use crate::styles::{SCROLLBAR_WIDTH, TEXT_PAD_LEFT};
 
 /// Monaco's `CLEAR_MOUSE_DOWN_COUNT_TIME`: presses further apart than this
 /// restart the click count at one.
@@ -208,13 +201,31 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         // Step aside for a scrollbar grab (the strip only exists when the
         // document overflows the viewport; the layer stack's height is the
         // document's).
+        //
+        // The strip is measured from the *scroll container's* right edge, not
+        // the layer stack's. They used to coincide — the stack had no width, so
+        // it laid out exactly as wide as its container. Now that it is the
+        // document's width, the stack's right edge can be tens of thousands of
+        // pixels away, and measuring from it would put the guard off-screen and
+        // let a scrollbar grab drop a caret.
         let viewport = ctx.view.client_height() as f32;
+        let view_right =
+            click.element_x + ctx.view.scroll_left() as f32 + ctx.view.client_width() as f32;
         if viewport > 0.0
             && click.element_height > viewport
-            && click.mouse_x >= click.element_x + click.element_width - SCROLLBAR_HIT_WIDTH
+            && click.mouse_x >= view_right - SCROLLBAR_WIDTH
         {
             return;
         }
+        // Monaco's `LongLinesHelper`: a press at or past the cap lifts it, for
+        // this editor, permanently. It keys on the *column*, not on hitting the
+        // chip element — which is why the chip needs no handler of its own, and
+        // why pressing in the blank space past a capped line's end works too.
+        //
+        // Decided inside the model borrow, applied outside it: writing the
+        // signal flushes the render effects, and those borrow the model.
+        let uncap;
+
         // Confine the borrow: the version bump below flushes render effects
         // that borrow the model.
         let mode = {
@@ -226,6 +237,9 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                 click.mouse_x - click.element_x - TEXT_PAD_LEFT,
                 click.mouse_y - click.element_y,
             );
+            let cap = ctx.stop_after.get();
+            uncap = cap != usize::MAX && m.buffer().position_of(offset).col >= cap;
+
             let count = ctx
                 .clicks
                 .borrow_mut()
@@ -279,8 +293,11 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                         primary: (0, end),
                     });
                     drop(m);
+                    if uncap {
+                        ctx.stop_after.set(usize::MAX);
+                    }
                     ctx.bump();
-                    (ctx.after_op)();
+                    (ctx.after_op)(true);
                     return;
                 }
             };
@@ -298,8 +315,13 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         // Repaint unconditionally: even a press on the caret's own cell can
         // collapse a selection or a multi-cursor set, and a redundant repaint of
         // an unchanged frame is cheap next to detecting one.
+        if uncap {
+            ctx.stop_after.set(usize::MAX);
+        }
         ctx.bump();
-        (ctx.after_op)();
+        // Mouse-driven: reveal the caret exactly, with no padding. You are
+        // pointing at the place; shifting the view under your finger is wrong.
+        (ctx.after_op)(true);
 
         // Capture the pointer for the selection drag. Every mode extends from
         // its gesture range — Monaco's per-move `_computeSelection` against
@@ -307,10 +329,21 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         // original range inside the selection, whichever way it goes. A move
         // past the viewport's top or bottom hands off to the auto-scroller
         // instead of extending; re-entering hands back.
-        let origin_x = click.element_x + TEXT_PAD_LEFT;
+        // The layer stack's own bounds go stale the moment the drag scrolls it,
+        // on either axis, so both origins are captured as the *scroll
+        // container's* viewport edges — `element + scroll` at the press — which
+        // hold still while the document slides under them. Every later use adds
+        // the live scroll offset back.
+        //
+        // The horizontal term is easy to leave out and impossible to notice
+        // until something scrolls sideways mid-drag: without it every hit-test
+        // after the first horizontal auto-scroll tick is off by the distance
+        // scrolled, and the selection runs away from the pointer.
+        let view_left = click.element_x + ctx.view.scroll_left() as f32;
         let view_top = click.element_y + ctx.scroll_top.get() as f32;
+        let origin_x = view_left + TEXT_PAD_LEFT;
         let mode = Rc::new(mode);
-        let scroller = AutoScroll::new(ctx.clone(), mode.clone(), origin_x, view_top);
+        let scroller = AutoScroll::new(ctx.clone(), mode.clone(), origin_x, view_left, view_top);
         // Park the scroller where a later press and the unmount cleanup can
         // reach it; stop any predecessor a lost `on_end` left behind.
         if let Some(old) = ctx.scroller.borrow_mut().replace(scroller.clone()) {
@@ -321,8 +354,12 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
         let end_slot = ctx.scroller.clone();
         Drag::absolute()
             .on_move(move |mx, my| {
-                let viewport = drag.view.client_height() as f32;
-                if viewport > 0.0 && (my < view_top || my > view_top + viewport) {
+                let viewport_h = drag.view.client_height() as f32;
+                let viewport_w = drag.view.client_width() as f32;
+                let scroll_left = drag.view.scroll_left() as f32;
+                let outside = (viewport_h > 0.0 && (my < view_top || my > view_top + viewport_h))
+                    || (viewport_w > 0.0 && (mx < view_left || mx > view_left + viewport_w));
+                if outside {
                     scroller.update_pointer(mx, my);
                     return;
                 }
@@ -330,8 +367,13 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                 let changed = {
                     let mut m = drag.model.borrow_mut();
                     let doc_y = my - view_top + drag.scroll_top.get() as f32;
-                    let offset =
-                        hit_offset(&m, &drag.grid, drag.cell_w.get(), mx - origin_x, doc_y);
+                    let offset = hit_offset(
+                        &m,
+                        &drag.grid,
+                        drag.cell_w.get(),
+                        mx - origin_x + scroll_left,
+                        doc_y,
+                    );
                     let primary = *m.selections().primary();
                     // Moves within the same cell change nothing on a char
                     // drag — skip even computing; mousemove arrives per
@@ -357,7 +399,7 @@ pub(crate) fn text_mousedown(ctx: InputCtx) -> impl Fn() {
                 };
                 if changed {
                     drag.bump();
-                    (drag.after_op)();
+                    (drag.after_op)(true);
                 }
             })
             .on_end(move |_, _| {

@@ -66,8 +66,19 @@ impl Grid {
     /// line is unavoidable: a tab's width depends on how many cells precede it,
     /// so there is no closed form. `char_col` past the line end clamps to the end.
     pub fn visual_column(&self, line_text: &str, char_col: usize) -> usize {
+        self.visual_width(line_text.chars(), char_col)
+    }
+
+    /// The same walk over any character source, so a caller holding a rope slice
+    /// need not materialize it into a `String` first.
+    ///
+    /// This exists for the horizontal scroll range, which folds a max over every
+    /// visible line on every scroll: allocating one `String` per line per frame
+    /// is a megabyte of churn on a file of long lines, and the walk never needs
+    /// the characters to be contiguous.
+    pub fn visual_width(&self, chars: impl Iterator<Item = char>, count: usize) -> usize {
         let mut vcol = 0;
-        for ch in line_text.chars().take(char_col) {
+        for ch in chars.take(count) {
             vcol += self.cell_advance(ch, vcol);
         }
         vcol

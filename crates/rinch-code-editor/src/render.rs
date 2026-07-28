@@ -20,18 +20,26 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use rinch::core::Memo;
+use rinch::core::{Memo, Signal};
 use rinch_code_editor_model::{EditorModel, Grid, Theme, TokenMetadata, selection_spans};
 
-use crate::styles::LINE_HEIGHT;
+use crate::styles::{LINE_HEIGHT, overflow_seg_style, seg_style};
 
-/// One coloured run within a rendered line.
+/// One run within a rendered line: a coloured span of glyphs, or the chip that
+/// stands in for everything a capped line does not draw.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Seg {
     pub key: usize,
     pub text: String,
-    pub color: String,
+    /// The whole inline style, not just a colour, because the overflow chip is
+    /// not merely a differently-coloured run.
+    pub style: String,
 }
+
+/// The key the overflow chip is reconciled under. No token index can collide
+/// with it, and keeping it constant means a line whose tail keeps growing
+/// reuses the same node instead of rebuilding it.
+const OVERFLOW_KEY: usize = usize::MAX;
 
 /// A line prepared for rendering: its 1-based number, its pixel top, and its
 /// coloured segments.
@@ -63,29 +71,46 @@ pub(crate) struct SelRect {
 /// sliced by its token spans and each span coloured from the theme palette. Takes
 /// `&mut` because asking the highlighter for a line's tokens may parse and cache.
 /// Only `range` (already clamped to the document by the caller) is materialized.
+///
+/// `cap` is Monaco's `stopRenderingLineAfter`: no line contributes more than
+/// that many characters of DOM, however long it is, and one that overruns gets
+/// a chip saying how much was left out. This is the whole of the horizontal
+/// story — Monaco does no column windowing, so neither do we, and a line is
+/// drawn from its first character up to the cap regardless of where the
+/// viewport happens to be. `usize::MAX` means uncapped, which is what a click
+/// past the cap switches a line to.
 pub(crate) fn compute_lines(
     model: &mut EditorModel,
     range: Range<usize>,
     default_color: &str,
+    cap: usize,
 ) -> Vec<LineRender> {
     let end = range.end.min(model.len_lines());
     let mut out = Vec::with_capacity(end.saturating_sub(range.start));
     for i in range.start..end {
         let chars: Vec<char> = model.buffer().line_text(i).chars().collect();
+        let drawn = chars.len().min(cap);
         let tokens = model.line_tokens(i);
         let theme = model.theme();
 
         let mut segs = Vec::new();
         for (k, span) in tokens.iter().enumerate() {
             let start = span.start as usize;
-            let end = (span.end as usize).min(chars.len());
+            let end = (span.end as usize).min(drawn);
             if start >= end {
                 continue;
             }
             segs.push(Seg {
                 key: k,
                 text: chars[start..end].iter().collect(),
-                color: color_of(theme, span.metadata, default_color),
+                style: seg_style(&color_of(theme, span.metadata, default_color)),
+            });
+        }
+        if chars.len() > drawn {
+            segs.push(Seg {
+                key: OVERFLOW_KEY,
+                text: format!("Show more ({})", overflow_label(chars.len() - drawn)),
+                style: overflow_seg_style(),
             });
         }
         out.push(LineRender {
@@ -95,6 +120,19 @@ pub(crate) fn compute_lines(
         });
     }
     out
+}
+
+/// Monaco's `renderOverflowingCharCount`, ported exactly — including that it
+/// labels *characters* with byte units above 1024, which is Monaco's wording
+/// and not a mistake to tidy up on the way through.
+fn overflow_label(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} chars")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / 1024.0 / 1024.0)
+    }
 }
 
 /// The gutter rows for the visible `range`. Tops are document coordinates; the
@@ -138,11 +176,20 @@ pub(crate) fn compute_sel_rects(
 }
 
 /// The primary caret's grid position: `(line, visual_column)`.
-pub(crate) fn caret_grid(model: &EditorModel, grid: &Grid) -> (usize, usize) {
+///
+/// The column is clamped to `cap`, so a caret past a capped line's drawn
+/// portion is parked at the cap rather than floating in the blank space beyond
+/// it — Monaco does the same, by clamping the columns
+/// `getVisibleRangesForRange` will answer for. The model's caret is untouched;
+/// this is only where it is *drawn*.
+pub(crate) fn caret_grid(model: &EditorModel, grid: &Grid, cap: usize) -> (usize, usize) {
     let buffer = model.buffer();
     let head = buffer.position_of(model.selections().primary().head);
     let head_line_text = buffer.line_text(head.line);
-    (head.line, grid.visual_column(&head_line_text, head.col))
+    (
+        head.line,
+        grid.visual_column(&head_line_text, head.col.min(cap)),
+    )
 }
 
 /// The line the primary caret sits on — what the current-line band highlights.
@@ -191,9 +238,15 @@ pub(crate) fn text_rows(
     visible: Memo<Range<usize>>,
     model: &Rc<RefCell<EditorModel>>,
     default_color: &str,
+    stop_after: Signal<usize>,
 ) -> Vec<LineRender> {
     let range = visible.get();
-    compute_lines(&mut model.borrow_mut(), range, default_color)
+    compute_lines(
+        &mut model.borrow_mut(),
+        range,
+        default_color,
+        stop_after.get(),
+    )
 }
 
 /// A token's foreground as a CSS colour, falling back to the editor default when

@@ -53,6 +53,7 @@ mod model;
 mod presence;
 mod select;
 mod spans;
+mod width;
 
 pub use clipboard::ClipboardPayload;
 pub use cursor::Motion;
@@ -64,6 +65,7 @@ pub use presence::{
 };
 pub use select::{extend_from, line_drag, line_range_at, word_drag, word_range_at};
 pub use spans::{LineSpan, selection_spans};
+pub use width::{DocumentWidth, max_visual_columns};
 
 // Re-export the foundation types a caller needs to drive the model, so a
 // downstream view can depend on this one crate for the whole editing surface —

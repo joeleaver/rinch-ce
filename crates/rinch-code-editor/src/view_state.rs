@@ -22,15 +22,17 @@
 //! Before the first layout both measurements read 0, and the fallbacks stand in
 //! for exactly one frame.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
 use rinch::core::{Memo, NodeHandle, Signal};
-use rinch_code_editor_model::{EditorModel, Grid};
+use rinch_code_editor_model::{EditorModel, Grid, max_visual_columns};
 
 use crate::render;
-use crate::styles::{FALLBACK_CELL_WIDTH, PROBE_LEN};
+use crate::styles::{
+    FALLBACK_CELL_WIDTH, OVERFLOW_CHIP_CELLS, PROBE_LEN, SCROLL_BEYOND_LAST_COLUMN, TEXT_PAD_LEFT,
+};
 use crate::{FALLBACK_VIEWPORT_H, OVERSCAN};
 
 /// Everything the render derives from the document and the scroll position.
@@ -43,6 +45,9 @@ pub(crate) struct ViewState {
     pub cell_w: Memo<f32>,
     /// The document's full pixel height; the layer stack is sized to it.
     pub content_h: Memo<f32>,
+    /// The scrollable pixel width — Monaco's `scrollWidth`. See
+    /// [`ViewState::new`] for why it only ever grows.
+    pub content_w: Memo<f32>,
     /// The line the primary caret is on — what the current-line band highlights.
     pub current_line: Memo<usize>,
     /// The primary caret's `(line, visual_column)`.
@@ -57,6 +62,7 @@ impl ViewState {
         grid: Grid,
         version: Signal<u64>,
         scroll_top: Signal<f64>,
+        stop_after: Signal<usize>,
         probe: NodeHandle,
         view: NodeHandle,
     ) -> Self {
@@ -87,7 +93,7 @@ impl ViewState {
             let m = model.clone();
             move || {
                 version.get();
-                render::caret_grid(&m.borrow(), &grid)
+                render::caret_grid(&m.borrow(), &grid, stop_after.get())
             }
         });
         // Recomputes on edit (`version`) and on scroll (`scroll_top`), which is
@@ -108,9 +114,66 @@ impl ViewState {
             }
         });
 
+        // The horizontal scroll range, folded the way Monaco folds it: a
+        // maximum over the lines currently materialized, which only ever grows.
+        //
+        // Monaco does this because it cannot measure a line it has not put in
+        // the DOM. We could measure any line — see the note in the model
+        // crate's `width` module for why we follow it anyway. The visible
+        // consequence, in Monaco and here, is that the horizontal scroll range
+        // grows as you scroll down past a long line and does not shrink when
+        // you scroll back; the mark resets only when the whole document is on
+        // screen at once, which is Monaco's own reset condition.
+        //
+        // The mark is kept in **visual columns**, not pixels. Monaco stores
+        // pixels and resets on a font change; columns are independent of the
+        // cell advance, so the first frame's fallback width cannot strand a
+        // too-wide mark when the real measurement arrives.
+        let content_w = Memo::new({
+            let m = model.clone();
+            let widest = Rc::new(Cell::new(0usize));
+            move || {
+                version.get();
+                let range = visible.get();
+                let cw = cell_w.get();
+                let cols = {
+                    let mb = m.borrow();
+                    let whole_document = range.start == 0 && range.end >= mb.len_lines();
+                    // The *live* cap, not the constant: a line the user has
+                    // uncapped is drawn in full, so the document is that wide.
+                    let seen = max_visual_columns(mb.buffer(), &grid, range, stop_after.get());
+                    // A truncated line ends in a chip, which is laid out past
+                    // the last drawn cell and has to stay inside the scroll
+                    // range — it is the only way back to the hidden text.
+                    let width = seen.columns + if seen.capped { OVERFLOW_CHIP_CELLS } else { 0 };
+                    if whole_document {
+                        width
+                    } else {
+                        width.max(widest.get())
+                    }
+                };
+                widest.set(cols);
+                // Monaco's `_computeContentWidth`, less its vertical-scrollbar
+                // term: on web `client_width` already excludes the scrollbar,
+                // and desktop paints its own as an overlay.
+                //
+                // Monaco's other half — `scrollWidth = max(viewportWidth,
+                // contentWidth)` — is deliberately *not* applied here. It needs
+                // the viewport width, which measures 0 before the first layout,
+                // and this memo has nothing that would recompute it afterwards.
+                // `layers_style` expresses that maximum as `min-width:100%` and
+                // lets layout resolve it instead. The consequence for callers is
+                // that this value can be *narrower* than the viewport, which is
+                // exactly what the horizontal clamp in `scroll.rs` wants — a
+                // document that fits has a maximum scroll of zero.
+                TEXT_PAD_LEFT + (cols + SCROLL_BEYOND_LAST_COLUMN) as f32 * cw
+            }
+        });
+
         Self {
             cell_w,
             content_h,
+            content_w,
             current_line,
             caret,
             visible,
