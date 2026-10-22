@@ -359,7 +359,7 @@ pub fn CodeEditor(
             }
 
             // Selection rectangles (z 1) — behind the glyphs, visible slice only.
-            for rect in selection_rects(visible, &model, grid) {
+            for rect in selection_rects(version, visible, &model, grid) {
                 div {
                     key: rect.key,
                     style: {
@@ -372,7 +372,7 @@ pub fn CodeEditor(
 
             // Collaborators' selections (z 1) — emitted after the local ones so
             // that at equal depth, DOM order puts a peer's tint over yours.
-            for rect in remote_rects(visible, peers, &model, grid) {
+            for rect in remote_rects(version, visible, peers, &model, grid) {
                 div {
                     key: format!("{}:{}", rect.peer, rect.span.line),
                     style: {
@@ -390,7 +390,7 @@ pub fn CodeEditor(
             }
 
             // Text rows (z 2) — visible slice only.
-            for line in text_rows(visible, &model, &default_color, stop_after) {
+            for line in text_rows(version, visible, &model, &default_color, stop_after) {
                 div {
                     key: line.number,
                     style: line_style(line.top),
@@ -429,7 +429,7 @@ pub fn CodeEditor(
             // that (the block's setup runs each time, then returns the closure)
             // without putting bindings in front of the element, where the macro
             // would also copy them into the key closure and warn them unused.
-            for c in remote_carets(visible, peers, &model, grid) {
+            for c in remote_carets(version, visible, peers, &model, grid) {
                 div {
                     key: c.peer,
                     style: {
@@ -446,7 +446,7 @@ pub fn CodeEditor(
             // flag: reconciliation reuses a node whose key has not changed, so a
             // flag read at build time would never be re-read. Moving a peer
             // between the lists is an insertion and a removal, which it handles.
-            for c in remote_dots(visible, peers, chip_tick, &chips, &model, grid) {
+            for c in remote_dots(version, visible, peers, chip_tick, &chips, &model, grid) {
                 div {
                     key: c.peer,
                     style: {
@@ -457,7 +457,7 @@ pub fn CodeEditor(
                 }
             }
 
-            for c in remote_chips(visible, peers, chip_tick, &chips, &model, grid) {
+            for c in remote_chips(version, visible, peers, chip_tick, &chips, &model, grid) {
                 // The one binding that has to sit out here: the chip's text is a
                 // child node, and the style effect below captures `c` by move.
                 let name = c.name.clone();
@@ -505,7 +505,7 @@ pub fn CodeEditor(
                 style: gutter_style(),
                 div {
                     style: { move || gutter_scroll_style(scroll_top.get(), content_h.get()) },
-                    for row in gutter_rows(visible, &model) {
+                    for row in gutter_rows(version, visible, &model) {
                         div {
                             key: row.number,
                             style: number_style(row.top),
