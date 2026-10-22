@@ -197,7 +197,7 @@ pub fn CodeEditor(
     // stack is appended into it below.
     let view = __scope.create_element("div");
     view.set_attribute("style", VIEW_STYLE);
-    let scroll_handler = __scope.register_scroll_handler(move |st| scroll_top.set(st));
+    let scroll_handler = __scope.register_scroll_handler(move |ev| scroll_top.set(ev.scroll_top));
     view.set_attribute("data-onscroll", &scroll_handler.0.to_string());
 
     // A hidden probe of known length: its measured width divided by its length is
