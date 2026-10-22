@@ -5,8 +5,16 @@
 //! installing a second interceptor replaces the first. A component that
 //! installed its own would therefore work perfectly right up until somebody
 //! mounted two of them, at which point the older editor would go quietly deaf.
-//! So the interceptor is installed **once per process**, by whichever editor
-//! mounts first, and every editor registers itself here instead.
+//! So the interceptor is installed **once per document**, by whichever editor
+//! mounts there first, and every editor registers itself here instead.
+//!
+//! "Once" has to mean for good. rinch ties an interceptor installed during a
+//! render to that render's scope and clears it when the scope goes, so one
+//! installed from the first editor's render would leave with the first editor
+//! and take every later editor's keyboard with it (rinch-ce#10). It is
+//! installed with no owner instead, and lives as long as the document does.
+//! It is keyed by document because rinch's interceptor slot is: one installed
+//! while a window's document is mounting serves that window alone.
 //!
 //! # Focus is ours to arbitrate
 //!
@@ -31,7 +39,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use rinch::core::{KeyEventData, set_keyboard_interceptor};
+use rinch::core::{KeyEventData, current_dispatching_doc, set_keyboard_interceptor, unowned};
 
 use crate::input::{self, InputCtx};
 
@@ -54,19 +62,30 @@ impl EditorId {
 thread_local! {
     static EDITORS: RefCell<Vec<(EditorId, InputCtx)>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(0) };
-    static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// The documents the interceptor has been installed in, by rinch's
+    /// document identity — `None` being rinch's ownerless slot, which serves
+    /// every document that has no interceptor of its own.
+    static INSTALLED: RefCell<Vec<Option<u64>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Add an editor to the registry, installing the process-wide key interceptor
-/// if this is the first one.
+/// Add an editor to the registry, installing the key interceptor if this is the
+/// first editor in its document.
 pub(crate) fn register(id: EditorId, ctx: InputCtx) {
     EDITORS.with_borrow_mut(|editors| editors.push((id, ctx)));
-    INSTALLED.with(|installed| {
-        if !installed.get() {
-            installed.set(true);
-            set_keyboard_interceptor(dispatch);
+    let doc = current_dispatching_doc();
+    let first = INSTALLED.with_borrow_mut(|installed| {
+        let first = !installed.contains(&doc);
+        if first {
+            installed.push(doc);
         }
+        first
     });
+    if first {
+        // Owned by nobody, so no editor's unmount clears it. The document is
+        // unaffected: rinch keys the slot by the document dispatching now,
+        // not by the owner.
+        unowned(|| set_keyboard_interceptor(dispatch));
+    }
 }
 
 /// Remove an unmounted editor. Its cleanup hook calls this: the registry holds
@@ -166,3 +185,7 @@ fn dispatch(ev: &KeyEventData) -> bool {
 fn snapshot() -> Vec<(EditorId, InputCtx)> {
     EDITORS.with_borrow(|editors| editors.clone())
 }
+
+#[cfg(test)]
+#[path = "focus_tests.rs"]
+mod tests;

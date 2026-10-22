@@ -3141,6 +3141,7 @@ version = "0.1.0"
 dependencies = [
  "rinch",
  "rinch-code-editor-model",
+ "rinch-core",
  "web-time",
 ]
 

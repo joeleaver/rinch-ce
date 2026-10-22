@@ -30,6 +30,11 @@ web-time = "1"
 # links no tree-sitter and no C, and `CodeEditor` falls back to plain text. This
 # is the lean Joe approved: no runtime grammar loading, no dynamic registry —
 # the set of languages is a compile-time decision the consuming app owns.
+[dev-dependencies]
+# For `MockDomDocument`: the focus tests mount editors with no backend, and a
+# `NodeHandle` needs a document type even when it points at none.
+rinch-core = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 tree-sitter = ["rinch-code-editor-model/tree-sitter"]
