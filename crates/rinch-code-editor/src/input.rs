@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rinch::core::{KeyEventData, Memo, NodeHandle, Signal};
+use rinch::core::{KeyEventData, KeyEventKind, Memo, NodeHandle, Signal};
 use rinch_code_editor_model::{EditorModel, Grid, Motion, Selection, Selections};
 
 use crate::autoscroll::AutoScroll;
@@ -163,6 +163,13 @@ pub(crate) fn handle_key(ctx: &InputCtx, ev: &KeyEventData) -> bool {
 /// edit that is a no-op (backspace at the very start) is consumed but changes
 /// nothing, so it does not trigger a repaint.
 fn apply(m: &mut EditorModel, grid: &Grid, ev: &KeyEventData, page_lines: usize) -> Option<bool> {
+    // Every binding here acts on the press. The interceptor hears the release
+    // too (rinch #337), spelled exactly like the press, so without this a
+    // physical keystroke would be applied twice. Left unclaimed: the runtime
+    // ignores a release's return value, and nothing else is owed it.
+    if ev.kind == KeyEventKind::Up {
+        return None;
+    }
     // Ctrl combos first. On desktop `meta` is always false — Cmd arrives as ctrl
     // — so ctrl is the one modifier that carries shortcuts. Key strings arrive
     // lowercase from the desktop backend but verbatim (case follows Shift) from
@@ -278,3 +285,7 @@ fn is_printable(key: &str) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod tests;

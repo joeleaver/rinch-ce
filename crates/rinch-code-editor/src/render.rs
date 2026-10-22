@@ -206,9 +206,14 @@ pub(crate) fn content_height(model: &EditorModel) -> f32 {
 // ---- reactive reads --------------------------------------------------------
 //
 // The component calls each of these from inside an rsx `for`. Every one reads the
-// `visible` memo first — establishing the reactive dependency on both the document
-// version and the scroll position that memo folds in — then returns freshly
-// computed render data for that window.
+// document `version` and the `visible` window first, establishing the reactive
+// dependency on both, then returns freshly computed render data for that window.
+//
+// The version has to be read *directly*. The window memo reads it too, but rinch
+// memos cut off on equality (rinch #882): a dependent woken only through a memo
+// re-runs only when the memo's value changed, and typing inside a line leaves the
+// window exactly where it was. A helper that heard about edits only through the
+// window kept the old text on screen until a scroll moved it (rinch-ce#8).
 //
 // They are named functions, and they live here rather than inline in the
 // component, for a reason that is pure macro mechanics: an rsx `for`'s iterator
@@ -218,28 +223,34 @@ pub(crate) fn content_height(model: &EditorModel) -> f32 {
 // idents its iterator expression references, and a module path is not a value.
 
 pub(crate) fn gutter_rows(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     model: &Rc<RefCell<EditorModel>>,
 ) -> Vec<GutterRow> {
+    version.get();
     let range = visible.get();
     compute_gutter(range, model.borrow().len_lines())
 }
 
 pub(crate) fn selection_rects(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     model: &Rc<RefCell<EditorModel>>,
     grid: Grid,
 ) -> Vec<SelRect> {
+    version.get();
     let range = visible.get();
     compute_sel_rects(&model.borrow(), &grid, range)
 }
 
 pub(crate) fn text_rows(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     model: &Rc<RefCell<EditorModel>>,
     default_color: &str,
     stop_after: Signal<usize>,
 ) -> Vec<LineRender> {
+    version.get();
     let range = visible.get();
     compute_lines(
         &mut model.borrow_mut(),
@@ -257,3 +268,7 @@ fn color_of(theme: &Theme, metadata: TokenMetadata, default: &str) -> String {
         .map(|c| c.to_css())
         .unwrap_or_else(|| default.to_string())
 }
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;

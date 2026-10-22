@@ -161,7 +161,9 @@ impl ChipClock {
 // ---- reactive reads --------------------------------------------------------
 //
 // Same contract as the ones in [`mod@crate::render`]: read the signals first so
-// the dependency is established, then compute. Called from an rsx `for`, so each
+// the dependency is established, then compute. That includes the document
+// `version`, read directly rather than only through the `visible` memo, which
+// does not move on an edit inside a line. Called from an rsx `for`, so each
 // must be a plain call — the iterator expression is parsed only up to the first
 // `{` and cannot be a block.
 //
@@ -174,11 +176,13 @@ impl ChipClock {
 
 /// Every collaborator's selection rectangles, for the visible window.
 pub(crate) fn remote_rects(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     peers: Signal<Vec<RemotePresence>>,
     model: &Rc<RefCell<EditorModel>>,
     grid: Grid,
 ) -> Vec<PresenceRect> {
+    version.get();
     let range = visible.get();
     let peers = peers.get();
     let model = model.borrow();
@@ -191,11 +195,13 @@ pub(crate) fn remote_rects(
 /// nothing about where a caret is, and reading it here would rebuild every bar
 /// twice a peer.
 pub(crate) fn remote_carets(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     peers: Signal<Vec<RemotePresence>>,
     model: &Rc<RefCell<EditorModel>>,
     grid: Grid,
 ) -> Vec<PresenceCaret> {
+    version.get();
     let range = visible.get();
     let peers = peers.get();
     let model = model.borrow();
@@ -204,6 +210,7 @@ pub(crate) fn remote_carets(
 
 /// The carets whose owner is currently labelled — these get a name chip.
 pub(crate) fn remote_chips(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     peers: Signal<Vec<RemotePresence>>,
     chip_tick: Signal<u64>,
@@ -211,11 +218,13 @@ pub(crate) fn remote_chips(
     model: &Rc<RefCell<EditorModel>>,
     grid: Grid,
 ) -> Vec<PresenceCaret> {
+    version.get();
     labelled_carets(visible, peers, chip_tick, clock, model, grid, true)
 }
 
 /// The carets whose owner is not currently labelled — these get the plain dot.
 pub(crate) fn remote_dots(
+    version: Signal<u64>,
     visible: Memo<Range<usize>>,
     peers: Signal<Vec<RemotePresence>>,
     chip_tick: Signal<u64>,
@@ -223,11 +232,13 @@ pub(crate) fn remote_dots(
     model: &Rc<RefCell<EditorModel>>,
     grid: Grid,
 ) -> Vec<PresenceCaret> {
+    version.get();
     labelled_carets(visible, peers, chip_tick, clock, model, grid, false)
 }
 
 /// The shared body of the two above. Reading `chip_tick` is what lets a chip
-/// come *down* on its own once the clock says its dwell is over.
+/// come *down* on its own once the clock says its dwell is over. The callers
+/// read the document version themselves.
 fn labelled_carets(
     visible: Memo<Range<usize>>,
     peers: Signal<Vec<RemotePresence>>,
