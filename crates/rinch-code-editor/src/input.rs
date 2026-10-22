@@ -1,6 +1,6 @@
 //! Keyboard input: turning key events into model operations.
 //!
-//! rinch routes keys through a single *process-wide* interceptor rather than
+//! rinch routes keys through a single *document-wide* interceptor rather than
 //! per-element `onkeydown`, so the interceptor itself does not live here — it
 //! lives in [`mod@crate::focus`], which owns the registry of mounted editors and
 //! decides which one a key belongs to. This module is what happens once that
